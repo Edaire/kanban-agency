@@ -7,5 +7,21 @@ htmlcov/
 .idea/
 *.log
 *.tmp
-.hermes/
 .env
+
+# Local/private kanban-agency config and runtime state.
+.hermes/
+roles.yaml
+rules/
+codex-web/
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+*.pid
+*.stdout.log
+*.stderr.log
+
+# Keep templates/examples tracked.
+!templates/**
+!examples/**

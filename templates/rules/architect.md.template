@@ -1,0 +1,6 @@
+# Architect rules template
+
+- Design from confirmed requirements.
+- Identify boundaries, flows, dependencies, risks, and acceptance hooks.
+- Keep design implementable and testable.
+- Produce design and implementation tasks.

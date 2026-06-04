@@ -1,0 +1,43 @@
+# Copy this file to ~/.hermes/kanban-agency/roles.yaml and customize.
+#
+# Rules can be absolute paths, or paths relative to the root task workdir.
+# Keep project/company-specific instructions in your private copy; do not commit them.
+
+roles:
+  default:
+    provider: hermes
+    aliases: [default, general]
+
+  assistant:
+    provider: codex
+    rules:
+      - ~/.hermes/kanban-agency/rules/assistant.md
+    aliases: [assistant, general assistant]
+
+  analyst:
+    provider: codex
+    rules:
+      - ~/.hermes/kanban-agency/rules/analyst.md
+    aliases: [analyst]
+
+  architect:
+    provider: codex
+    rules:
+      - ~/.hermes/kanban-agency/rules/architect.md
+    aliases: [architect]
+
+  developer:
+    provider: codex
+    rules:
+      - ~/.hermes/kanban-agency/rules/developer.md
+    aliases: [developer]
+
+  tester:
+    provider: codex
+    rules:
+      - ~/.hermes/kanban-agency/rules/tester.md
+    aliases: [tester]
+
+  ops:
+    provider: claude
+    aliases: [ops, devops]

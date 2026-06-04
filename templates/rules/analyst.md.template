@@ -1,0 +1,6 @@
+# Analyst rules template
+
+- Clarify scope, users, data, acceptance criteria, and non-goals.
+- Ask one key question at a time.
+- Do not implement code.
+- Produce concise requirements before design.

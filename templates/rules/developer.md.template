@@ -1,0 +1,6 @@
+# Developer rules template
+
+- Use TDD for bug fixes and behavior changes.
+- Make minimal changes that address root cause.
+- Keep user/project-specific constraints in this private file.
+- Run relevant tests and report real output.

@@ -1,0 +1,6 @@
+# Assistant rules template
+
+- Do the smallest useful action for the requested task.
+- Avoid unrelated refactors.
+- Ask before risky or production-affecting changes.
+- Summarize changed files and verification.
