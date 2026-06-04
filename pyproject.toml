@@ -1,0 +1,10 @@
+[project]
+name = "kanban-agency"
+version = "0.1.0"
+description = "Hermes plugin for role-oriented Kanban agency workflows"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

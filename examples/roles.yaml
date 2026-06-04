@@ -1,0 +1,35 @@
+# Example kanban-agency role registry
+# Copy to ~/.hermes/kanban-agency/roles.yaml and adjust rule paths.
+roles:
+  default:
+    provider: hermes
+    aliases: [default, general]
+
+  assistant:
+    provider: codex
+    rules: [examples/rules/assistant.md]
+    aliases: [assistant, general assistant]
+
+  analyst:
+    provider: codex
+    rules: [examples/rules/analyst.md]
+    aliases: [analyst]
+
+  architect:
+    provider: codex
+    rules: [examples/rules/architect.md]
+    aliases: [architect]
+
+  developer:
+    provider: codex
+    rules: [examples/rules/developer.md]
+    aliases: [developer]
+
+  tester:
+    provider: codex
+    rules: [examples/rules/tester.md]
+    aliases: [tester]
+
+  ops:
+    provider: claude
+    aliases: [ops, devops]

@@ -1,0 +1,13 @@
+name: kanban-agency
+version: 0.1.0
+description: "Role/session orchestration layer on top of Hermes Kanban."
+author: "Hermes local plugin"
+provides_tools:
+  - kanban_agency_scan
+  - kanban_agency_start
+  - kanban_agency_run
+  - kanban_agency_continue
+  - kanban_agency_sync
+  - kanban_agency_codex_web
+  - kanban_agency_codex_web_stop
+provides_hooks: []
