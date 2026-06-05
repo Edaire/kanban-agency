@@ -533,7 +533,7 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
         kb.add_comment(conn, task.id, author="kanban-agency", body=(
             "Claude interactive tmux session started.\n"
             f"URL: {claude_session_url(task.id)}\n"
-            f"Direct ttyd: {url}\nRead-only ttyd: {readonly_url}\n"
+            f"Direct ttyd: {url}\n"
             f"tmux: {tmux_name}\n"
             f"cwd: {cwd}\n\n"
             "Use this TUI to handle login/approval/chat. Closing the browser page will not kill the Claude tmux session."
@@ -1706,6 +1706,16 @@ def task_view_html(task_id: str) -> str:
 let atBottom=true;const pre=document.getElementById('out');function nearBottom(){{return pre.scrollTop+pre.clientHeight>=pre.scrollHeight-8}}pre.addEventListener('scroll',()=>{{atBottom=nearBottom()}});async function poll(){{try{{const r=await fetch('/view-text/{task_esc}',{{cache:'no-store'}});const t=await r.text();if(pre.textContent!==t){{const stick=atBottom||nearBottom();pre.textContent=t;if(stick)pre.scrollTop=pre.scrollHeight;}}}}catch(e){{}}}}pre.scrollTop=pre.scrollHeight;setInterval(poll,2000);
 </script></body></html>"""
 
+
+
+def _claude_session_live(task_id: str) -> dict[str, Any]:
+    web = _read_json_file(_claude_web_state_path(task_id))
+    pid = web.get("pid")
+    ttyd_alive = bool(pid and _pid_alive(pid))
+    tmux_name = web.get("tmux_name") or web.get("tmux")
+    tmux_alive = bool(tmux_name and _tmux_has_session(str(tmux_name)))
+    return {"live": bool(ttyd_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
+
 def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
     """Status payload used by the /s/<task_id> wrapper for tab alerts."""
     provider = None
@@ -1724,10 +1734,16 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
         finally:
             conn.close()
     bridge = _load_bridge_state(task_id)
-    web = _read_json_file(_codex_web_state_path(task_id))
-    thread_id = web.get('thread_id') or bridge.get('thread_id')
-    live = _codex_native_session_live(task_id, thread_id) if (provider in {None, 'codex'} or thread_id) else {"live": False}
-    pending = _codex_live_pending_approval(thread_id) if thread_id else {"pending": False, "reason": "no_thread"}
+    if provider == 'claude':
+        web = _read_json_file(_claude_web_state_path(task_id))
+        thread_id = None
+        live = _claude_session_live(task_id)
+        pending = {"pending": False, "reason": "claude_interactive"}
+    else:
+        web = _read_json_file(_codex_web_state_path(task_id))
+        thread_id = web.get('thread_id') or bridge.get('thread_id')
+        live = _codex_native_session_live(task_id, thread_id) if (provider in {None, 'codex'} or thread_id) else {"live": False}
+        pending = _codex_live_pending_approval(thread_id) if thread_id else {"pending": False, "reason": "no_thread"}
     return {
         "ok": True,
         "task_id": task_id,
@@ -1992,7 +2008,8 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(500); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
             target = data.get('url') or ''
             status_url = '/status/' + task_id
-            title = 'Codex ' + task_id
+            provider_name = 'Claude' if provider == 'claude' else 'Codex'
+            title = provider_name + ' ' + task_id
             page = '''<!doctype html><html><head><meta charset="utf-8"><title>{{title}}</title><style>
 html,body,#frame{{margin:0;width:100%;height:100%;background:#0b0f14;overflow:hidden}}iframe{{border:0;width:100%;height:100%}}
 #alert{{display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#b45309;color:white;padding:8px 12px;font:14px system-ui,sans-serif;box-shadow:0 2px 10px #0008}}
