@@ -665,11 +665,10 @@ def run(board: str, listen: str = "ws://127.0.0.1:8795", dry_run: bool = False, 
                 try:
                     data = claude_interactive_run_task(board, task, meta)
                     if data.get("ok"):
-                        if (data.get("state") or {}).get("reason") != "interactive_session":
-                            try:
-                                _mark_running(conn, task.id)
-                            except Exception:
-                                pass
+                        try:
+                            _mark_running(conn, task.id)
+                        except Exception:
+                            pass
                         target = reused if data.get("reused") else started
                         target.append({"task_id": task.id, "role": role, "provider": provider, "state": data.get("state")})
                     else:
@@ -686,6 +685,10 @@ def run(board: str, listen: str = "ws://127.0.0.1:8795", dry_run: bool = False, 
             try:
                 data = codex_native_run_task(board, task, meta)
                 if data.get("ok"):
+                    try:
+                        _mark_running(conn, task.id)
+                    except Exception:
+                        pass
                     target = reused if data.get("reused") else started
                     target.append({"task_id": task.id, "role": role, "provider": provider, "state": data.get("state"), "url": data.get("url")})
                 else:
