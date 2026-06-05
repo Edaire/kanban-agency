@@ -1708,6 +1708,33 @@ let atBottom=true;const pre=document.getElementById('out');function nearBottom()
 
 
 
+
+
+def _claude_attention_status(task_id: str) -> dict[str, Any]:
+    web = _read_json_file(_claude_web_state_path(task_id))
+    tmux_name = web.get("tmux_name") or web.get("tmux")
+    if not tmux_name:
+        return {"pending": False, "reason": "no_tmux"}
+    tmux_name = str(tmux_name)
+    if not _tmux_has_session(tmux_name):
+        return {"pending": False, "reason": "tmux_not_alive", "tmux_name": tmux_name}
+    try:
+        text = subprocess.check_output(["tmux", "capture-pane", "-t", tmux_name, "-p", "-S", "-80"], text=True, stderr=subprocess.STDOUT)
+    except Exception as exc:
+        return {"pending": False, "reason": f"capture_failed: {exc}", "tmux_name": tmux_name}
+    tail = "\n".join(text.splitlines()[-12:])
+    lower = tail.lower()
+    permission_markers = [
+        "do you want to proceed", "allow", "permission", "yes, i accept", "bypass permissions", "trust this folder"
+    ]
+    prompt_markers = ["❯", "? for shortcuts"]
+    busy_markers = ["●", "⏺", "running", "reading", "writing", "churned"]
+    if any(m in lower for m in permission_markers):
+        return {"pending": True, "kind": "permission_prompt", "tmux_name": tmux_name, "tail": tail}
+    if any(m in tail for m in prompt_markers):
+        return {"pending": True, "kind": "waiting_for_input", "tmux_name": tmux_name, "tail": tail}
+    return {"pending": False, "kind": "running_or_idle_no_prompt", "tmux_name": tmux_name, "tail": tail}
+
 def _claude_session_live(task_id: str) -> dict[str, Any]:
     web = _read_json_file(_claude_web_state_path(task_id))
     pid = web.get("pid")
@@ -1738,7 +1765,7 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
         web = _read_json_file(_claude_web_state_path(task_id))
         thread_id = None
         live = _claude_session_live(task_id)
-        pending = {"pending": False, "reason": "claude_interactive"}
+        pending = _claude_attention_status(task_id)
     else:
         web = _read_json_file(_codex_web_state_path(task_id))
         thread_id = web.get('thread_id') or bridge.get('thread_id')
