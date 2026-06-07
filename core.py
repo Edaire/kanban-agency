@@ -477,6 +477,40 @@ def _tmux_has_session(name: str) -> bool:
     except Exception:
         return False
 
+
+
+def _prompt_still_visible(screen: str, prompt_path: Path) -> bool:
+    try:
+        prompt = prompt_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        prompt = ""
+    markers = ["工作目录：", "需要做的功能是：", "请按工作规则"]
+    return sum(1 for m in markers if m in screen) >= 2
+
+
+def _ensure_prompt_submitted(tmux_name: str, prompt_path: Path, attempts: int = 2, delay: float = 1.0) -> dict[str, Any]:
+    """Verify pasted role prompt is not still sitting in the native TUI input box.
+
+    Codex/Claude native TUIs occasionally need an extra Enter after tmux paste.
+    If the captured pane still shows the full role prompt markers, send Enter
+    again instead of leaving the Kanban task misleadingly running.
+    """
+    extra = 0
+    last = ""
+    for i in range(max(1, attempts)):
+        if delay:
+            time.sleep(delay)
+        try:
+            last = subprocess.check_output(["tmux", "capture-pane", "-t", str(tmux_name), "-p", "-S", "-60"], text=True, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            return {"submitted": False, "extra_enter_sent": extra, "reason": f"capture_failed: {exc}"}
+        if _prompt_still_visible(last, prompt_path):
+            subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
+            extra += 1
+            continue
+        return {"submitted": True, "extra_enter_sent": extra}
+    return {"submitted": not _prompt_still_visible(last, prompt_path), "extra_enter_sent": extra, "reason": "prompt_still_visible" if _prompt_still_visible(last, prompt_path) else None}
+
 def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> dict[str, Any]:
     """Start/attach a persistent native Claude TUI via tmux + ttyd.
 
@@ -509,6 +543,7 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
         subprocess.run(["tmux", "load-buffer", "-t", tmux_name, str(prompt_path)], check=False)
         subprocess.run(["tmux", "paste-buffer", "-t", tmux_name], check=False)
         subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
+        _ensure_prompt_submitted(str(tmux_name), prompt_path)
     CLAUDE_WEB_DIR.mkdir(parents=True, exist_ok=True)
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
@@ -602,6 +637,7 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
         subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
         subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
         subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
+        _ensure_prompt_submitted(str(tmux_name), prompt_path)
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
     readonly_port = _free_port()
