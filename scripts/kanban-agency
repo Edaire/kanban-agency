@@ -1,4 +1,4 @@
-#!/Users/admin/code/opensource/hermes-agent/venv/bin/python
+#!/usr/bin/env python3
 from __future__ import annotations
 
 from pathlib import Path

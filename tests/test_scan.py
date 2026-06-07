@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import os
 import subprocess
 import sys
@@ -8,7 +9,16 @@ import tempfile
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = Path('/Users/admin/code/opensource/hermes-agent')
+
+
+def _default_hermes_repo() -> Path:
+    spec = importlib.util.find_spec('hermes_cli')
+    if spec and spec.origin:
+        return Path(spec.origin).resolve().parents[1]
+    return Path.cwd()
+
+
+REPO_ROOT = Path(os.environ.get('HERMES_AGENT_REPO', str(_default_hermes_repo())))
 
 CODE = r"""
 import os, sys

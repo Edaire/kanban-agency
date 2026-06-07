@@ -455,15 +455,11 @@ def _ensure_claude_ops_settings() -> Path:
         src = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
     except Exception:
         src = {}
-    try:
-        local = json.loads((Path("/Users/admin/code/edd/mcps/.claude/settings.local.json")).read_text(encoding="utf-8"))
-    except Exception:
-        local = {}
     data = {
         "env": src.get("env", {}),
         "model": src.get("model"),
         "mcpServers": src.get("mcpServers", {}),
-        "permissions": local.get("permissions", {}),
+        "permissions": src.get("permissions", {}),
         "hasCompletedOnboarding": True,
     }
     dest.parent.mkdir(parents=True, exist_ok=True)
