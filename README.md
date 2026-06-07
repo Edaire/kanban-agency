@@ -1,5 +1,7 @@
 # Kanban Agency
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **Kanban-native multi-agent orchestration for Hermes Agent, OpenAI Codex CLI, and Anthropic Claude Code.**
 
 Kanban Agency turns a Hermes Kanban board into a live AI-agent cockpit: split a feature into roles, run each role in its own native Codex or Claude Code terminal, and keep the whole workflow auditable through Kanban tasks.
