@@ -1232,6 +1232,7 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
     if not path:
         return {"pending": False, "reason": "no_session_file"}
     pending: dict[str, dict[str, Any]] = {}
+    last_task_complete: dict[str, Any] | None = None
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as exc:
@@ -1255,13 +1256,23 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
                 pending[call_id] = {"timestamp": obj.get("timestamp"), "call_id": call_id, "name": payload.get("name"), "cmd": args.get("cmd"), "workdir": args.get("workdir"), "justification": args.get("justification"), "session_file": str(path)}
         elif typ == "function_call_output" and call_id:
             pending.pop(call_id, None)
+        elif obj.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            last_task_complete = {
+                "timestamp": obj.get("timestamp"),
+                "kind": "role_completed_waiting_complete",
+                "last_agent_message": payload.get("last_agent_message"),
+                "completed_at": payload.get("completed_at"),
+                "session_file": str(path),
+            }
         elif obj.get("type") == "event_msg" and payload.get("type") in {"exec_command_end", "patch_apply_end"}:
             cid = payload.get("call_id")
             if cid:
                 pending.pop(cid, None)
     if pending:
         last = list(pending.values())[-1]
-        return {"pending": True, **last}
+        return {"pending": True, "kind": "approval_required", **last}
+    if last_task_complete:
+        return {"pending": True, **last_task_complete}
     return {"pending": False, "session_file": str(path)}
 
 def _parents_satisfied(conn, task_id: str) -> bool:
@@ -1338,15 +1349,33 @@ def monitor(board: str, task_id: str | None = None, dry_run: bool = False) -> di
                 continue
             pending = _codex_live_pending_approval(thread_id)
             if pending.get("pending"):
+                kind = pending.get("kind")
+                is_complete = kind == "role_completed_waiting_complete"
                 if task.status != "blocked":
-                    reason = f"Native Codex session is waiting for approval: {pending.get('justification') or pending.get('cmd') or pending.get('call_id')}"
+                    if is_complete:
+                        reason = "Native Codex role completed; waiting for human Complete."
+                        comment = (
+                            "Native Codex role completed; waiting for human Complete.\n"
+                            f"summary: {pending.get('last_agent_message') or ''}\n"
+                            f"session: {pending.get('session_file')}"
+                        )
+                        action = "marked_blocked_role_complete"
+                    else:
+                        reason = f"Native Codex session is waiting for approval: {pending.get('justification') or pending.get('cmd') or pending.get('call_id')}"
+                        comment = (
+                            "Native Codex approval required.\n"
+                            f"command: {pending.get('cmd')}\n"
+                            f"reason: {pending.get('justification')}\n"
+                            f"session: {pending.get('session_file')}"
+                        )
+                        action = "marked_blocked_native_approval"
                     if not dry_run:
                         with kb.write_txn(conn):
                             _set_status(conn, task.id, "blocked", result=reason)
-                            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)", (task.id, "kanban-agency", f"Native Codex approval required.\ncommand: {pending.get('cmd')}\nreason: {pending.get('justification')}\nsession: {pending.get('session_file')}", int(time.time())))
-                    monitored.append({"task_id": task.id, "action": "marked_blocked_native_approval", "from_status": task.status, "pending": pending, "dry_run": dry_run})
+                            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)", (task.id, "kanban-agency", comment, int(time.time())))
+                    monitored.append({"task_id": task.id, "action": action, "from_status": task.status, "pending": pending, "dry_run": dry_run})
                 else:
-                    monitored.append({"task_id": task.id, "action": "already_blocked_native_approval", "pending": pending})
+                    monitored.append({"task_id": task.id, "action": "already_blocked_role_complete" if is_complete else "already_blocked_native_approval", "pending": pending})
             elif live.get("live"):
                 if task.status != "running":
                     if not dry_run:
