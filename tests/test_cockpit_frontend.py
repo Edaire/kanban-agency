@@ -51,9 +51,30 @@ def test_cockpit_distinguishes_role_definitions_from_role_sessions():
     assert "data-task" in html
 
 
+def test_cockpit_sidebar_labels_roles_and_sessions():
+    core = load_core()
+    html = core._cockpit_html('__all__')
+
+    assert 'id="tabRoles"' in html
+    assert 'id="tabSessions"' in html
+    assert 'Role Catalog' not in html
+
+
 def test_cockpit_defaults_independent_task_group_collapsed():
     core = load_core()
     html = core._cockpit_html('some_board')
 
     assert "root.collapsed" in html
     assert "collapsed&&!expandedRoots.has(key)" in html
+
+
+
+def test_cockpit_left_sidebar_has_exclusive_roles_and_sessions_modes():
+    core = load_core()
+    html = core._cockpit_html('some_board')
+
+    assert 'let sideMode=' in html
+    assert 'function setSideMode' in html
+    assert 'function renderRoleSide' in html
+    assert 'function renderSessionSide' in html
+    assert 'sideMode===\'roles\'' in html
