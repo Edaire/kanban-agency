@@ -100,3 +100,27 @@ def test_sessions_all_does_not_repeat_role_catalog_per_board(env):
     data = core.sessions_all()
 
     assert data['available_roles'] == []
+
+
+
+def test_independent_role_sessions_are_collapsed_and_newest_first(env, monkeypatch):
+    core = load_core()
+    board = make_board(core)
+    monkeypatch.setattr(core, 'run', lambda board, task_id=None, **kw: {'board': board, 'started': [{'task_id': task_id}], 'errors': []})
+
+    first = core.open_role_workspace(board, 'researcher')
+    core.mark_role_workspace_exited(board, 'researcher', reason='test')
+    second = core.open_role_workspace(board, 'developer')
+    conn = core.kb.connect(board=board)
+    try:
+        with core.kb.write_txn(conn):
+            conn.execute('update tasks set created_at=? where id=?', (100, first['task_id']))
+            conn.execute('update tasks set created_at=? where id=?', (200, second['task_id']))
+    finally:
+        conn.close()
+
+    data = core.sessions_status(board)
+    root = next(r for r in data['roots'] if r['title'] == 'Independent tasks')
+
+    assert root['collapsed'] is True
+    assert [r['task_id'] for r in root['roles'][:2]] == [second['task_id'], first['task_id']]

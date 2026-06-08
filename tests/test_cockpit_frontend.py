@@ -38,3 +38,22 @@ def test_cockpit_does_not_rewrite_dom_when_content_is_unchanged():
     assert 'if(html===lastSideHtml)return' in html
     assert 'h.dataset.last!==next' in html
     assert 'document.title!==nextTitle' in html
+
+
+
+def test_cockpit_distinguishes_role_definitions_from_role_sessions():
+    core = load_core()
+    html = core._cockpit_html('some_board')
+
+    assert 'class="chip role-def ${rr.active?\'active\':\'idle\'}"' in html
+    assert "rr.active?'active':'idle'" in html
+    assert "data-role" in html
+    assert "data-task" in html
+
+
+def test_cockpit_defaults_independent_task_group_collapsed():
+    core = load_core()
+    html = core._cockpit_html('some_board')
+
+    assert "root.collapsed" in html
+    assert "collapsed&&!expandedRoots.has(key)" in html
