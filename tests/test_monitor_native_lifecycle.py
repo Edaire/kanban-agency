@@ -173,3 +173,44 @@ def test_monitor_blocks_on_task_complete_waiting_human_complete(env, monkeypatch
     assert row['status'] == 'blocked'
     assert 'waiting for human Complete' in row['result']
     assert out['monitored'][0]['action'] == 'marked_blocked_role_complete'
+
+
+
+def test_codex_attention_clears_old_task_complete_after_appended_turn(env):
+    core = load_core()
+    session_dir = Path.home() / '.codex' / 'sessions' / '2026' / '06' / '08'
+    session_dir.mkdir(parents=True)
+    session = session_dir / 'rollout-thread-appended.jsonl'
+    session.write_text('\n'.join([
+        json.dumps({'timestamp': 't1', 'type': 'event_msg', 'payload': {'type': 'task_complete', 'last_agent_message': '上一轮完成，等待 Complete。'}}),
+        json.dumps({'timestamp': 't2', 'type': 'event_msg', 'payload': {'type': 'task_started'}}),
+        json.dumps({'timestamp': 't3', 'type': 'event_msg', 'payload': {'type': 'user_message', 'message': '追加处理一个问题'}}),
+    ]), encoding='utf-8')
+
+    out = core._codex_live_pending_approval('thread-appended')
+
+    assert out['pending'] is False
+    assert out['reason'] == 'appended_turn_after_task_complete'
+
+
+def test_monitor_marks_blocked_complete_task_running_after_appended_turn(env, monkeypatch):
+    core = load_core()
+    board = 'monitor_appended_turn'
+    task_id = make_task(core, board, str(env), status='blocked')
+    monkeypatch.setattr(core, '_reset_waiting_on_upstream', lambda conn, task: False)
+    monkeypatch.setattr(core, '_load_bridge_state', lambda task_id: {'thread_id': 'thread-appended'})
+    monkeypatch.setattr(core, '_codex_native_session_live', lambda task_id, thread_id=None: {
+        'live': True, 'thread_id': 'thread-appended', 'url': 'http://127.0.0.1:1/', 'tmux_alive': True
+    })
+    monkeypatch.setattr(core, '_read_session_binding', lambda thread_id: {'active_task_id': task_id})
+    monkeypatch.setattr(core, '_codex_live_pending_approval', lambda thread_id: {
+        'pending': False,
+        'reason': 'appended_turn_after_task_complete',
+        'session_file': '/tmp/session.jsonl',
+    })
+
+    out = core.monitor(board, task_id=task_id)
+    row = get_status(core, board, task_id)
+
+    assert row['status'] == 'running'
+    assert out['monitored'][0]['action'] == 'marked_running_native_live'

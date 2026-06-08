@@ -1233,6 +1233,7 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
         return {"pending": False, "reason": "no_session_file"}
     pending: dict[str, dict[str, Any]] = {}
     last_task_complete: dict[str, Any] | None = None
+    saw_task_complete = False
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception as exc:
@@ -1257,6 +1258,7 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
         elif typ == "function_call_output" and call_id:
             pending.pop(call_id, None)
         elif obj.get("type") == "event_msg" and payload.get("type") == "task_complete":
+            saw_task_complete = True
             last_task_complete = {
                 "timestamp": obj.get("timestamp"),
                 "kind": "role_completed_waiting_complete",
@@ -1264,6 +1266,9 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
                 "completed_at": payload.get("completed_at"),
                 "session_file": str(path),
             }
+        elif obj.get("type") == "event_msg" and payload.get("type") in {"task_started", "user_message"}:
+            if last_task_complete:
+                last_task_complete = None
         elif obj.get("type") == "event_msg" and payload.get("type") in {"exec_command_end", "patch_apply_end"}:
             cid = payload.get("call_id")
             if cid:
@@ -1273,7 +1278,8 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
         return {"pending": True, "kind": "approval_required", **last}
     if last_task_complete:
         return {"pending": True, **last_task_complete}
-    return {"pending": False, "session_file": str(path)}
+    reason = "appended_turn_after_task_complete" if saw_task_complete else "no_pending_approval"
+    return {"pending": False, "reason": reason, "session_file": str(path)}
 
 def _parents_satisfied(conn, task_id: str) -> bool:
     """Whether real upstream role dependencies are satisfied.
