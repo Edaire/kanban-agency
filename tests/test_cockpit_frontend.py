@@ -55,8 +55,10 @@ def test_cockpit_sidebar_labels_roles_and_sessions():
     core = load_core()
     html = core._cockpit_html('__all__')
 
-    assert 'id="tabRoles"' in html
-    assert 'id="tabSessions"' in html
+    assert '<div class="board-title">Roles</div>' in html
+    assert '<div class="board-title">Sessions</div>' in html
+    assert 'id="tabRoles"' not in html
+    assert 'id="tabSessions"' not in html
     assert 'Role Catalog' not in html
 
 
@@ -69,12 +71,12 @@ def test_cockpit_defaults_independent_task_group_collapsed():
 
 
 
-def test_cockpit_left_sidebar_has_exclusive_roles_and_sessions_modes():
+def test_cockpit_left_sidebar_stacks_roles_above_sessions():
     core = load_core()
     html = core._cockpit_html('some_board')
 
-    assert 'let sideMode=' in html
-    assert 'function setSideMode' in html
     assert 'function renderRoleSide' in html
     assert 'function renderSessionSide' in html
-    assert 'sideMode===\'roles\'' in html
+    assert 'renderRoleSide()+renderSessionSide()' in html
+    assert 'let sideMode=' not in html
+    assert 'function setSideMode' not in html
