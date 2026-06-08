@@ -167,3 +167,21 @@ def test_session_alert_reports_tmux_lifecycle(env, monkeypatch):
     assert st['tmux_alive'] is True
     assert st['ttyd_alive'] is False
     assert st['tmux_name'] == 'kanban-codex-test'
+
+
+
+def test_blocked_role_counts_as_attention_even_without_live_pending(env, monkeypatch):
+    core = load_core()
+    board = 'blocked_attention'
+    _, roles = create_root_with_roles(core, board, 'Needs attention', '/tmp/work', [('tester', 'blocked')])
+    monkeypatch.setattr(core, 'session_alert_status', lambda board, task_id: {
+        'pending_approval': False,
+        'pending': {'pending': False, 'reason': 'no_current_provider_bell'},
+        'live': True,
+    })
+
+    data = core.sessions_status(board)
+    tester = next(r for root in data['roots'] for r in root['roles'] if r.get('task_id') == roles['tester'])
+
+    assert tester['pending_approval'] is True
+    assert data['roots'][0]['attention'] == 1

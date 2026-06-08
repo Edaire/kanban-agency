@@ -2101,7 +2101,11 @@ def sessions_status(board: str) -> dict[str, Any]:
             st = session_alert_status(board, task.id)
             parents = [dict(r) for r in conn.execute("SELECT p.id,p.title,p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=?", (task.id,)).fetchall()]
             active_task = task.status not in SKIP_STATUSES
-            return {"role":role,"task_id":task.id,"title":task.title,"task_status":task.status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":active_task and bool(st.get('pending_approval')),"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":st.get('pending') if active_task else None,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
+            is_attention = active_task and (task.status == "blocked" or bool(st.get('pending_approval')))
+            pending_payload = st.get('pending') if active_task else None
+            if task.status == "blocked" and (not pending_payload or not pending_payload.get("pending")):
+                pending_payload = {"pending": True, "kind": "blocked", "reason": task.result}
+            return {"role":role,"task_id":task.id,"title":task.title,"task_status":task.status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
 
         grouped_task_ids = set()
         for rr in root_rows:
