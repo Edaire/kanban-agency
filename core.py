@@ -1827,9 +1827,49 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
     }
 
 
+
+
+_AUTO_ADVANCE_LAST: dict[str, float] = {}
+_AUTO_ADVANCE_INTERVAL_SECONDS = 5.0
+
+
+def _auto_advance_board(board: str) -> dict[str, Any]:
+    """Auto-start already-ready agency role sessions before cockpit renders.
+
+    Human Complete lets Kanban recompute the child to ready. The next cockpit
+    refresh starts only those already-ready role sessions. It deliberately does
+    not call run(board) for every role, because that can rebuild existing running
+    sessions; and it does not call advance(), because simply viewing Cockpit must
+    not create missing workflow tasks.
+    """
+    now = float(time.time())
+    last = _AUTO_ADVANCE_LAST.get(board, 0.0)
+    if now - last < _AUTO_ADVANCE_INTERVAL_SECONDS:
+        return {"ok": True, "skipped": "throttled"}
+    _AUTO_ADVANCE_LAST[board] = now
+    ready_ids: list[str] = []
+    conn = kb.connect(board=board)
+    try:
+        for row in _role_rows(conn):
+            task = kb.Task.from_row(row)
+            meta = _parse_role_body(task.body)
+            if task.status == "ready" and meta.get("provider") in {"codex", "claude"}:
+                ready_ids.append(task.id)
+    finally:
+        conn.close()
+    results = []
+    errors = []
+    for tid in ready_ids:
+        try:
+            results.append(run(board=board, task_id=tid))
+        except Exception as exc:
+            errors.append(f"run {tid} failed: {exc}")
+    return {"ok": not errors, "ready_task_ids": ready_ids, "runs": results, "errors": errors}
+
 def sessions_status(board: str) -> dict[str, Any]:
     if not board or not kb.board_exists(board):
         return {"ok": False, "board": board, "roots": [], "error": f"board not found: {board}"}
+    auto_advance = _auto_advance_board(board)
     conn = kb.connect(board=board)
     try:
         root_rows = conn.execute("SELECT * FROM tasks WHERE title NOT LIKE '[agency] %' AND status != 'archived' ORDER BY created_at DESC,id DESC").fetchall()
@@ -1870,7 +1910,7 @@ def sessions_status(board: str) -> dict[str, Any]:
                 independent_roles.append(item)
         if independent_roles:
             roots.append({"root_id":"__independent__","title":"Independent tasks","status":"running","attention":sum(1 for r in independent_roles if r.get('pending_approval')),"roles":independent_roles})
-        return {"ok": True, "board": board, "roots": roots}
+        return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance}
     finally:
         conn.close()
 
