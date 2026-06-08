@@ -2154,10 +2154,7 @@ def sessions_all() -> dict[str, Any]:
         if active_roots:
             boards.append({"board": slug, "title": board_title, "root_count": len(active_roots)})
             roots.extend(active_roots)
-    available_roles = []
-    for b in boards:
-        available_roles.extend(_available_role_defs(b.get("board") or ""))
-    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": available_roles}
+    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": []}
 
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>

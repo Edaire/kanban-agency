@@ -89,3 +89,14 @@ def test_cockpit_html_contains_role_drag_support(env):
     assert 'data-role' in html
     assert 'openRole' in html
     assert '/roles/' in html
+
+
+
+def test_sessions_all_does_not_repeat_role_catalog_per_board(env):
+    core = load_core()
+    make_board(core, 'board_one')
+    make_board(core, 'board_two')
+
+    data = core.sessions_all()
+
+    assert data['available_roles'] == []
