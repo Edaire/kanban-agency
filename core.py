@@ -40,6 +40,9 @@ ROLE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 WORKDIR_RE = re.compile(r"(?m)^\s*workdir:\s*(\S.*?)\s*$")
 ACTIVE_STATUSES = {"todo", "ready", "running", "blocked", "review"}
 SKIP_STATUSES = {"done", "archived"}
+DEFAULT_INDEPENDENT_ROLES = ["researcher", "analyst", "architect", "developer", "tester", "ops", "assistant"]
+ROLE_WORKSPACE_DIR = Path.home() / ".hermes" / "kanban-agency" / "role-workspaces"
+
 
 
 @dataclass
@@ -1868,6 +1871,174 @@ _AUTO_ADVANCE_LAST: dict[str, float] = {}
 _AUTO_ADVANCE_INTERVAL_SECONDS = 5.0
 
 
+
+def _safe_role_key(role: str) -> str:
+    key = (role or "").strip().lower().replace("-", "_")
+    if not ROLE_KEY_RE.match(key):
+        raise ValueError(f"invalid role key: {role!r}")
+    return key
+
+
+def _role_workspace_state_path(board: str, role: str) -> Path:
+    return ROLE_WORKSPACE_DIR / board / f"{_safe_role_key(role)}.json"
+
+
+def _read_role_workspace_state(board: str, role: str) -> dict[str, Any]:
+    return _read_json_file(_role_workspace_state_path(board, role))
+
+
+def _write_role_workspace_state(board: str, role: str, data: dict[str, Any]) -> None:
+    path = _role_workspace_state_path(board, role)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_file(path, data)
+
+
+def _available_role_defs(board: str) -> list[dict[str, Any]]:
+    keys: list[str] = []
+    providers: dict[str, str] = {}
+    try:
+        roles, _ = load_roles(CONFIG_PATH)
+        for key, role in roles.items():
+            if key == "default":
+                continue
+            keys.append(key)
+            providers[key] = role.provider if role.provider in {"codex", "claude"} else "codex"
+    except Exception:
+        pass
+    for key in DEFAULT_INDEPENDENT_ROLES:
+        if key not in keys:
+            keys.append(key)
+    return [{"role": key, "board": board, "provider": providers.get(key, "codex"), "title": key} for key in keys]
+
+
+def _ensure_independent_root(conn, board: str, workdir: str | None = None) -> str:
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE title=? AND body LIKE '%@kanban-agency-independent-root%' AND status != 'archived' ORDER BY created_at LIMIT 1",
+        ("Independent tasks",),
+    ).fetchone()
+    if row:
+        return str(row["id"])
+    return kb.create_task(
+        conn,
+        title="Independent tasks",
+        body="@kanban-agency-independent-root\n\nRole-scoped independent chats live under this root.",
+        created_by="kanban-agency",
+        workspace_kind="dir" if workdir else "scratch",
+        workspace_path=workdir or None,
+        initial_status="running",
+    )
+
+
+def _independent_role_instruction(role: str) -> str:
+    return (
+        f"这是一个独立 {role} 角色会话，不属于某个 feature workflow。\n"
+        "请先用简短摘要说明你能帮助解决的问题，然后等待用户给出具体任务。\n"
+        "用户没有显式 /exit 前，这个会话会被反复复用。\n"
+        "如果用户显式 /exit，请结束当前会话；之后拖拽 role 会创建新会话。\n"
+    )
+
+
+def _thread_has_explicit_exit(thread_id: str | None) -> bool:
+    if not thread_id:
+        return False
+    path = _find_codex_session_file(thread_id)
+    if not path:
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return False
+    for line in reversed(lines[-200:]):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        payload = obj.get("payload") or {}
+        if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+            text = str(payload.get("message") or payload.get("text") or payload.get("last_user_message") or "").strip()
+            return text == "/exit"
+    return False
+
+
+def _task_exists_for_workspace(board: str, task_id: str | None) -> bool:
+    if not task_id or not kb.board_exists(board):
+        return False
+    conn = kb.connect(board=board)
+    try:
+        row = conn.execute("SELECT status FROM tasks WHERE id=? AND status != 'archived'", (task_id,)).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
+def mark_role_workspace_exited(board: str, role: str, reason: str = "explicit exit") -> dict[str, Any]:
+    key = _safe_role_key(role)
+    state = _read_role_workspace_state(board, key)
+    state.update({"board": board, "role": key, "state": "exited", "exit_reason": reason, "exited_at": int(time.time()), "updated_at": int(time.time())})
+    _write_role_workspace_state(board, key, state)
+    return {"ok": True, "board": board, "role": key, "state": state}
+
+
+def _sync_role_workspace_exit(board: str, role: str, state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("state") == "active" and _thread_has_explicit_exit(state.get("thread_id")):
+        state.update({"state": "exited", "exit_reason": "user /exit", "exited_at": int(time.time()), "updated_at": int(time.time())})
+        _write_role_workspace_state(board, role, state)
+    return state
+
+
+def open_role_workspace(board: str, role: str, provider: str | None = None, workdir: str | None = None) -> dict[str, Any]:
+    if not board or not kb.board_exists(board):
+        return {"ok": False, "error": f"board not found: {board}"}
+    key = _safe_role_key(role)
+    state = _sync_role_workspace_exit(board, key, _read_role_workspace_state(board, key))
+    if state.get("state") == "active" and _task_exists_for_workspace(board, state.get("task_id")):
+        return {"ok": True, "reused": True, "board": board, "role": key, "task_id": state.get("task_id"), "root_id": state.get("root_id"), "url": f"/s/{state.get('task_id')}", "state": state}
+
+    meta = kb.read_board_metadata(board)
+    resolved_workdir = workdir or str(meta.get("default_workdir") or "") or os.getcwd()
+    role_provider = provider or next((r.get("provider") for r in _available_role_defs(board) if r.get("role") == key), "codex") or "codex"
+    if role_provider not in {"codex", "claude"}:
+        role_provider = "codex"
+    conn = kb.connect(board=board)
+    try:
+        root_id = _ensure_independent_root(conn, board, resolved_workdir)
+        title = f"[agency] {key}: independent chat"
+        body = _make_role_card_body(root_id, key, role_provider, resolved_workdir, "independent chat", _independent_role_instruction(key))
+        body += "\n@kanban-agency-independent\nsession_policy: reuse_until_exit\n"
+        task_id = kb.create_task(
+            conn,
+            title=title,
+            body=body,
+            assignee=_agency_assignee(key),
+            created_by="kanban-agency",
+            parents=[root_id],
+            initial_status="running",
+            workspace_kind="dir" if resolved_workdir else "scratch",
+            workspace_path=resolved_workdir or None,
+        )
+        try:
+            kb.promote_task(conn, task_id, actor="kanban-agency", reason="open independent role workspace", force=True)
+        except Exception:
+            pass
+    finally:
+        conn.close()
+    run_result = run(board=board, task_id=task_id)
+    web_state = _read_json_file(_codex_web_state_path(task_id)) if role_provider == "codex" else _read_claude_state(task_id)
+    new_state = {
+        "board": board,
+        "role": key,
+        "provider": role_provider,
+        "task_id": task_id,
+        "root_id": root_id,
+        "state": "active",
+        "thread_id": web_state.get("thread_id") or web_state.get("session_id"),
+        "tmux_name": web_state.get("tmux_name"),
+        "created_at": int(time.time()),
+        "updated_at": int(time.time()),
+    }
+    _write_role_workspace_state(board, key, new_state)
+    return {"ok": True, "reused": False, "board": board, "role": key, "task_id": task_id, "root_id": root_id, "url": f"/s/{task_id}", "run": run_result, "state": new_state}
+
 def _auto_advance_board(board: str) -> dict[str, Any]:
     """Auto-start already-ready agency role sessions before cockpit renders.
 
@@ -1945,7 +2116,7 @@ def sessions_status(board: str) -> dict[str, Any]:
                 independent_roles.append(item)
         if independent_roles:
             roots.append({"root_id":"__independent__","title":"Independent tasks","status":"running","attention":sum(1 for r in independent_roles if r.get('pending_approval')),"roles":independent_roles})
-        return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance}
+        return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
     finally:
         conn.close()
 
@@ -1983,12 +2154,15 @@ def sessions_all() -> dict[str, Any]:
         if active_roots:
             boards.append({"board": slug, "title": board_title, "root_count": len(active_roots)})
             roots.extend(active_roots)
-    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots}
+    available_roles = []
+    for b in boards:
+        available_roles.extend(_available_role_defs(b.get("board") or ""))
+    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": available_roles}
 
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
 *{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:auto;scrollbar-gutter:stable;padding:10px}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pane-ref{float:right;color:#60a5fa;font-weight:700}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
-</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="root-title">Sessions</div><div id="sessions"></div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><script>
+</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="root-title">Sessions</div><div id="sessions"></div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><script>
 const board='__BOARD__';const isAll=board==='__all__';let sessions={roots:[]};let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let lastSideHtml='';let panesRenderedWithData=false;const storageKey='kanban-cockpit-state:'+board;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,panes,active,expanded:[...expandedRoots]}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded)}catch(e){}}
 const layouts={"1":[1],"2":[1,2],"3":[1,2,3],"2x2":[1,2,4,5],"3x2":[1,2,3,4,5,6],"left-split":[1,4,2,3],"main-side":[1,2,5]};
 function visibleIds(){return layouts[layout]||[1,2,3]}
@@ -2001,21 +2175,23 @@ function rootBadge(root){if(root.attention)return `🔔 ${root.attention}`; cons
 function sym(s,p){if(p)return '🔔'; if(s==='done')return '✓'; if(s==='running')return '●'; if(s==='ready')return '◇'; if(s==='todo')return '○'; return '·'}
 function cls(r){if(r.pending_approval)return 'blocked'; return r.task_status||'missing'}
 function allRoles(){return sessions.roots.flatMap(root=>root.roles.map(role=>Object.assign({},role,{root_title:root.title,root_id:root.root_id})))}
+function roleCatalog(){return (sessions.available_roles||[]).filter(r=>r&&r.role&&r.board)}
 function paneRef(task){const idx=panes.findIndex(x=>x===task);return idx>=0?`<span class="pane-ref">#${idx+1}</span>`:''}
 function rootKey(root){return (root.board||board)+'/'+(root.root_id||root.title)}
 function setLayout(l){layout=l;paneCount=visibleIds().length;saveState();document.getElementById('panes').className='panes layout-'+l;active=visibleIds().includes(active+1)?active:paneIndex(visibleIds()[0]);renderLayouts();renderPanes();}
 function renderLayouts(){document.getElementById('layouts').innerHTML=Object.keys(layouts).map(l=>`<button class="layoutBtn ${l===layout?'active':''}" data-l="${l}">${l}</button>`).join('');document.querySelectorAll('.layoutBtn').forEach(b=>b.onclick=()=>setLayout(b.dataset.l));}
 function pickDefaults(){const roles=allRoles().filter(r=>r.task_id); const ranked=[...roles.filter(r=>r.pending_approval),...roles.filter(r=>r.task_status==='running'&&!r.pending_approval),...roles.filter(r=>r.task_status==='ready'),...roles.filter(r=>r.task_status==='done')]; const ids=[...new Set(ranked.map(r=>r.task_id))]; visibleIds().forEach((id,pos)=>{const i=paneIndex(id); panes[i]=panes[i]||ids[pos]||null;});}
 async function resumeTask(task){try{await fetch('/resume/'+encodeURIComponent(task),{cache:'no-store'});setPane(active,task);}catch(e){console.error(e)}}
+async function openRole(role,b){try{const r=await fetch('/roles/'+encodeURIComponent(b||board)+'/'+encodeURIComponent(role)+'/open',{cache:'no-store'});const data=await r.json();if(data&&data.ok&&data.task_id){setPane(active,data.task_id);await refresh();}else{console.error('openRole failed',data)}}catch(e){console.error(e)}}
 function clearDragging(){document.body.classList.remove('dragging')}
 window.addEventListener('mouseup',clearDragging,true);window.addEventListener('pointerup',clearDragging,true);window.addEventListener('blur',clearDragging,true);document.addEventListener('visibilitychange',clearDragging,true);
-function renderSide(){let html=''; let lastBoard=null; for(const root of sessions.roots){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-group"><div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
+function renderSide(){let html=''; const catalog=roleCatalog(); if(catalog.length){html+='<div class="board-group"><div class="board-title">Roles</div><div class="root open">'; for(const rr of catalog){const label=(isAll?shortBoard({board:rr.board,board_title:rr.board_title})+' / ':'')+rr.role; html+=`<button draggable="true" class="chip ready role-chip" title="Open ${esc(label)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">◇ ${esc(label)} <span class="small">role</span></button>`} html+='</div></div>';} let lastBoard=null; for(const root of sessions.roots){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-group"><div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
 function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.task_status==='done'&&r.has_session&&r.live)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
 function paneHtml(i){const r=rolesById()[panes[i]]; return `<div class="pane ${i===active?'active':''}"><div class="ph" data-pane="${i}"><span class="pane-id">#${i+1}</span>${r?`${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`:`empty`}</div><div class="body">${paneBody(r)}</div></div>`}
 function setActive(i){active=i;document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}
-function wirePane(pane,i){const h=pane.querySelector('.ph'); if(h)h.onclick=()=>setActive(i); const drop=e=>{e.preventDefault();clearDragging();pane.classList.remove('dropTarget');const task=e.dataTransfer.getData('text/plain'); if(task)setPane(i,task);}; const over=e=>{e.preventDefault();pane.classList.add('dropTarget')}; const leave=()=>pane.classList.remove('dropTarget'); pane.ondragover=over; pane.ondragleave=leave; pane.ondrop=drop; const b=pane.querySelector('.body'); if(b){b.ondragover=over;b.ondragleave=leave;b.ondrop=drop;}}
+function wirePane(pane,i){const h=pane.querySelector('.ph'); if(h)h.onclick=()=>setActive(i); const drop=e=>{e.preventDefault();clearDragging();pane.classList.remove('dropTarget');active=i;const roleRaw=e.dataTransfer.getData('application/x-kanban-agency-role'); if(roleRaw){try{const rr=JSON.parse(roleRaw);openRole(rr.role,rr.board);return;}catch(err){console.error(err)}} const task=e.dataTransfer.getData('text/plain'); if(task)setPane(i,task);}; const over=e=>{e.preventDefault();pane.classList.add('dropTarget')}; const leave=()=>pane.classList.remove('dropTarget'); pane.ondragover=over; pane.ondragleave=leave; pane.ondrop=drop; const b=pane.querySelector('.body'); if(b){b.ondragover=over;b.ondragleave=leave;b.ondrop=drop;}}
 function replacePaneDom(i){const container=document.getElementById('panes');const pos=visibleIds().indexOf(i+1);const old=pos>=0?container.children[pos]:null; if(old){old.outerHTML=paneHtml(i); wirePane(container.children[pos],i);}}
 function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld=panes[i]; if(from>=0&&from!==i){panes[i]=task;panes[from]=targetOld||null;replacePaneDom(i);replacePaneDom(from);} else {panes[i]=task;replacePaneDom(i);} active=i;saveState();setActive(i);renderSide(); if(visibleIds().indexOf(i+1)<0)renderPanes();}
 function renderPanes(){let html=''; for(const id of visibleIds())html+=paneHtml(paneIndex(id)); document.getElementById('panes').innerHTML=html; document.querySelectorAll('.pane').forEach((pane,pos)=>wirePane(pane,paneIndex(visibleIds()[pos])));}
@@ -2076,6 +2252,19 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/sessions':
             body = json.dumps(core.sessions_all(), ensure_ascii=False, indent=2).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith('/roles/') and path.endswith('/open'):
+            parts = path.strip('/').split('/')
+            if len(parts) >= 4:
+                board = parts[1].strip(); role = parts[2].strip()
+                body = json.dumps(core.open_role_workspace(board, role), ensure_ascii=False, indent=2).encode()
+            else:
+                body = json.dumps({{"ok": False, "error": "invalid role open path"}}, ensure_ascii=False).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith('/roles/'):
+            parts = path.strip('/').split('/')
+            board = parts[1].strip() if len(parts) > 1 else ''
+            body = json.dumps({{"ok": True, "board": board, "available_roles": core._available_role_defs(board)}}, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/sessions/'):
             board = path.strip('/').split('/', 1)[1].strip()
