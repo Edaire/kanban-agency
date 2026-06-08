@@ -40,6 +40,8 @@ ROLE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 WORKDIR_RE = re.compile(r"(?m)^\s*workdir:\s*(\S.*?)\s*$")
 ACTIVE_STATUSES = {"todo", "ready", "running", "blocked", "review"}
 SKIP_STATUSES = {"done", "archived"}
+INDEPENDENT_ROLE_BOARD = "kanban_agency_independent_tasks"
+INDEPENDENT_ROLE_BOARD_NAME = "Independent Role Chats"
 DEFAULT_INDEPENDENT_ROLES = ["researcher", "analyst", "architect", "developer", "tester", "ops", "assistant"]
 ROLE_WORKSPACE_DIR = Path.home() / ".hermes" / "kanban-agency" / "role-workspaces"
 
@@ -667,6 +669,78 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
             f"thread: {thread_id or ''}\n"
             f"cwd: {cwd}\n\n"
             "This tmux-backed TUI is the real execution surface; /s attaches to it."
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "reused": False, "state": state, "url": codex_session_url(task.id), "ttyd_url": url, "tmux": str(tmux_name)}
+
+
+
+def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, str]) -> dict[str, Any]:
+    """Start a native Codex TUI for an independent role without submitting work.
+
+    Role shortcuts are conversation starters. They should initialize the persona
+    and leave Codex at the input box so the user can type the actual task.
+    """
+    if not shutil.which("codex"):
+        return {"ok": False, "error": "codex command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
+    cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
+    cwd.mkdir(parents=True, exist_ok=True)
+    state_path = _codex_web_state_path(task.id)
+    state = _read_json_file(state_path)
+    tmux_name = state.get("tmux_name") or f"kanban-codex-{task.id}"
+    existing_pid = state.get("pid")
+    if _tmux_has_session(str(tmux_name)) and existing_pid and _pid_alive(existing_pid) and state.get("url"):
+        return {"ok": True, "reused": True, "state": state, "url": state.get("url")}
+
+    CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = Path.home() / ".hermes" / "codex-kanban-runs" / task.id / "native-tui"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = run_dir / "role-init.md"
+    prompt_path.write_text(_codex_prompt(task, meta), encoding="utf-8")
+    started_at = int(time.time())
+    if not _tmux_has_session(str(tmux_name)):
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec codex"], check=True)
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
+        time.sleep(1.0)
+        subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
+        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
+        # Deliberately do NOT press Enter: user starts the actual conversation.
+    use_port = _free_port()
+    url = f"http://127.0.0.1:{use_port}/"
+    readonly_port = _free_port()
+    readonly_url = f"http://127.0.0.1:{readonly_port}/"
+    stdout_path = CODEX_WEB_DIR / f"{task.id}.stdout.log"
+    stderr_path = CODEX_WEB_DIR / f"{task.id}.stderr.log"
+    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    out = stdout_path.open("ab"); err = stderr_path.open("ab")
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+    finally:
+        out.close(); err.close()
+    time.sleep(0.5)
+    thread_id = _latest_codex_thread_for_cwd(str(cwd), started_at)
+    state = {"task_id": task.id, "board": board, "provider": "codex", "mode": "native-tmux-role-init", "state": "waiting_for_user", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "thread_id": thread_id, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path), "submitted": False}
+    _write_json_file(state_path, state)
+    conn = kb.connect(board=board)
+    try:
+        _mark_running(conn, task.id)
+        ensure_codex_session_link(conn, board, task.id, thread_id=thread_id or str(tmux_name), cwd=str(cwd))
+        kb.add_comment(conn, task.id, author="kanban-agency", body=(
+            "Independent role Codex session initialized without submitting a task.\n"
+            f"URL: {codex_session_url(task.id)}\n"
+            f"Direct ttyd: {url}\n"
+            f"tmux: {tmux_name}\n"
+            f"cwd: {cwd}\n\n"
+            "The role prompt is prefilled; the user must type/submit the first task."
         ))
         conn.commit()
     finally:
@@ -1910,12 +1984,13 @@ def _available_role_defs(board: str) -> list[dict[str, Any]]:
             keys.append(key)
     out = []
     for key in keys:
-        state = _sync_role_workspace_exit(board, key, _read_role_workspace_state(board, key)) if board else {}
+        state_board = INDEPENDENT_ROLE_BOARD
+        state = _sync_role_workspace_exit(state_board, key, _read_role_workspace_state(state_board, key)) if state_board else {}
         task_id = state.get("task_id")
-        active = state.get("state") == "active" and _task_exists_for_workspace(board, task_id)
+        active = state.get("state") == "active" and _task_exists_for_workspace(state_board, task_id)
         out.append({
             "role": key,
-            "board": board,
+            "board": state_board,
             "provider": providers.get(key, "codex"),
             "title": key,
             "active": bool(active),
@@ -1986,6 +2061,7 @@ def _task_exists_for_workspace(board: str, task_id: str | None) -> bool:
 
 
 def mark_role_workspace_exited(board: str, role: str, reason: str = "explicit exit") -> dict[str, Any]:
+    board = INDEPENDENT_ROLE_BOARD
     key = _safe_role_key(role)
     state = _read_role_workspace_state(board, key)
     state.update({"board": board, "role": key, "state": "exited", "exit_reason": reason, "exited_at": int(time.time()), "updated_at": int(time.time())})
@@ -2001,16 +2077,18 @@ def _sync_role_workspace_exit(board: str, role: str, state: dict[str, Any]) -> d
 
 
 def open_role_workspace(board: str, role: str, provider: str | None = None, workdir: str | None = None) -> dict[str, Any]:
-    if not board or not kb.board_exists(board):
-        return {"ok": False, "error": f"board not found: {board}"}
+    source_board = board
+    board = INDEPENDENT_ROLE_BOARD
+    if not kb.board_exists(board):
+        kb.create_board(board, name=INDEPENDENT_ROLE_BOARD_NAME, description="Role-scoped independent chats for kanban-agency", default_workdir=workdir or os.getcwd())
     key = _safe_role_key(role)
     state = _sync_role_workspace_exit(board, key, _read_role_workspace_state(board, key))
     if state.get("state") == "active" and _task_exists_for_workspace(board, state.get("task_id")):
-        return {"ok": True, "reused": True, "board": board, "role": key, "task_id": state.get("task_id"), "root_id": state.get("root_id"), "url": f"/s/{state.get('task_id')}", "state": state}
+        return {"ok": True, "reused": True, "board": board, "source_board": source_board, "role": key, "task_id": state.get("task_id"), "root_id": state.get("root_id"), "url": f"/s/{state.get('task_id')}", "state": state}
 
     meta = kb.read_board_metadata(board)
     resolved_workdir = workdir or str(meta.get("default_workdir") or "") or os.getcwd()
-    role_provider = provider or next((r.get("provider") for r in _available_role_defs(board) if r.get("role") == key), "codex") or "codex"
+    role_provider = provider or next((r.get("provider") for r in _available_role_defs(source_board or board) if r.get("role") == key), "codex") or "codex"
     if role_provider not in {"codex", "claude"}:
         role_provider = "codex"
     conn = kb.connect(board=board)
@@ -2036,7 +2114,17 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
             pass
     finally:
         conn.close()
-    run_result = run(board=board, task_id=task_id)
+    if role_provider == "codex":
+        conn2 = kb.connect(board=board)
+        try:
+            task_obj = kb.Task.from_row(conn2.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+        finally:
+            conn2.close()
+        run_result = codex_native_init_role_session(board, task_obj, _parse_role_body(body))
+    else:
+        # Claude does not currently have a safe prefill-without-submit path here;
+        # keep the task initialized and waiting for the user to open/run explicitly.
+        run_result = {"ok": True, "initialized_only": True}
     web_state = _read_json_file(_codex_web_state_path(task_id)) if role_provider == "codex" else _read_claude_state(task_id)
     new_state = {
         "board": board,
@@ -2051,7 +2139,7 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
         "updated_at": int(time.time()),
     }
     _write_role_workspace_state(board, key, new_state)
-    return {"ok": True, "reused": False, "board": board, "role": key, "task_id": task_id, "root_id": root_id, "url": f"/s/{task_id}", "run": run_result, "state": new_state}
+    return {"ok": True, "reused": False, "board": board, "source_board": source_board, "role": key, "task_id": task_id, "root_id": root_id, "url": f"/s/{task_id}", "run": run_result, "state": new_state}
 
 def _auto_advance_board(board: str) -> dict[str, Any]:
     """Auto-start already-ready agency role sessions before cockpit renders.
