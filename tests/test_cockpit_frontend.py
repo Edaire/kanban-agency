@@ -55,10 +55,8 @@ def test_cockpit_sidebar_labels_roles_and_sessions():
     core = load_core()
     html = core._cockpit_html('__all__')
 
-    assert '<div class="board-title">Roles</div>' in html
-    assert '<div class="board-title">Sessions</div>' in html
-    assert 'id="tabRoles"' not in html
-    assert 'id="tabSessions"' not in html
+    assert 'id="tabRoles"' in html
+    assert 'id="tabSessions"' in html
     assert 'Role Catalog' not in html
 
 
@@ -71,12 +69,36 @@ def test_cockpit_defaults_independent_task_group_collapsed():
 
 
 
-def test_cockpit_left_sidebar_stacks_roles_above_sessions():
+def test_cockpit_left_sidebar_tabs_roles_and_sessions_without_touching_panes():
     core = load_core()
     html = core._cockpit_html('some_board')
 
+    assert 'id="tabSessions"' in html
+    assert 'id="tabRoles"' in html
+    assert "let sideMode='sessions'" in html
+    assert 'function setSideMode' in html
+    assert "sideMode==='roles'?renderRoleSide():renderSessionSide()" in html
+    assert 'function renderPanes' in html
+
+
+
+def test_cockpit_roles_tab_groups_sessions_under_roles():
+    core = load_core()
+    html = core._cockpit_html('__all__')
+
+    assert 'function roleSessionRoots' in html
+    assert "String(root.root_id||'').startsWith('role:')" in html
+    assert 'for(const r of roleSessions)' in html
+
+
+
+def test_sessions_tab_uses_role_labels_but_roles_tab_uses_content_titles():
+    core = load_core()
+    html = core._cockpit_html('__all__')
+
     assert 'function renderRoleSide' in html
     assert 'function renderSessionSide' in html
-    assert 'renderRoleSide()+renderSessionSide()' in html
-    assert 'let sideMode=' not in html
-    assert 'function setSideMode' not in html
+    # Roles tab lists role-owned sessions by content/problem title.
+    assert '${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)}' in html
+    # Sessions tab keeps the classic role label view.
+    assert '${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}' in html
