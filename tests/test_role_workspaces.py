@@ -197,3 +197,15 @@ def test_independent_role_title_uses_first_user_question_summary(env, monkeypatc
     role = next(r for root in data['roots'] for r in root['roles'] if r['task_id'] == opened['task_id'])
 
     assert role['display_title'].startswith('帮我调研一下 MCP Bundle')
+
+
+
+def test_orchestrator_role_defaults_to_hermes_when_configured(env):
+    core = load_core()
+    cfg = Path.home() / '.hermes' / 'kanban-agency' / 'roles.yaml'
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('roles:\n  default:\n    provider: hermes\n  orchestrator:\n    provider: hermes\n    aliases: [编排者]\n', encoding='utf-8')
+
+    roles = {r['role']: r for r in core._available_role_defs('anything')}
+
+    assert roles['orchestrator']['provider'] == 'hermes'

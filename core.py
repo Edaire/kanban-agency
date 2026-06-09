@@ -43,7 +43,7 @@ SKIP_STATUSES = {"done", "archived"}
 INDEPENDENT_ROLE_BOARD = "kanban_agency_independent_tasks"
 INDEPENDENT_ROLE_BOARD_NAME = "Independent Role Chats"
 INDEPENDENT_ROLE_DEFAULT_WORKDIR = str(Path.home() / "code" / "edd" / "mcps")
-DEFAULT_INDEPENDENT_ROLES = ["researcher", "analyst", "architect", "developer", "tester", "ops", "assistant"]
+DEFAULT_INDEPENDENT_ROLES = ["orchestrator", "researcher", "analyst", "architect", "developer", "tester", "ops", "assistant"]
 ROLE_WORKSPACE_DIR = Path.home() / ".hermes" / "kanban-agency" / "role-workspaces"
 
 
@@ -1911,6 +1911,10 @@ def ensure_codex_session_link(conn, board: str, task_id: str, thread_id: str | N
 
 def tmux_scroll_task(task_id: str, delta: int = -800) -> dict[str, Any]:
     state = _read_json_file(_codex_web_state_path(task_id))
+    if not state:
+        state = _read_json_file(_claude_web_state_path(task_id))
+    if not state:
+        state = _read_json_file(_hermes_web_state_path(task_id))
     tmux_name = state.get("tmux_name") or state.get("tmux")
     if not tmux_name:
         return {"ok": False, "error": "no tmux session recorded", "task_id": task_id}
@@ -2110,7 +2114,7 @@ def _available_role_defs(board: str) -> list[dict[str, Any]]:
         out.append({
             "role": key,
             "board": state_board,
-            "provider": providers.get(key, "codex"),
+            "provider": providers.get(key, "hermes" if key == "orchestrator" else "codex"),
             "title": key,
             "active": bool(active),
             "status": "active" if active else "idle",

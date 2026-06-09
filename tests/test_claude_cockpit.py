@@ -51,3 +51,19 @@ def test_claude_session_alert_status_uses_claude_web_state(env, monkeypatch):
     assert role['live'] is True
     assert role['ttyd_url'] == 'http://127.0.0.1:12345/'
     assert role['has_session'] is True
+
+
+
+def test_tmux_scroll_uses_claude_state_when_codex_state_absent(env, monkeypatch):
+    core = load_core()
+    task_id = 't_claude_scroll'
+    core._write_json_file(core._claude_web_state_path(task_id), {'provider': 'claude', 'tmux': 'kanban-claude-scroll'})
+    calls = []
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: name == 'kanban-claude-scroll')
+    monkeypatch.setattr(core.subprocess, 'run', lambda args, check=False, **kw: calls.append(args) or type('CP', (), {'returncode': 0})())
+
+    out = core.tmux_scroll_task(task_id, delta=-240)
+
+    assert out['ok'] is True
+    assert out['tmux_name'] == 'kanban-claude-scroll'
+    assert any('copy-mode' in args for args in calls)
