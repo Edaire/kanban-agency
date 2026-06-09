@@ -151,3 +151,15 @@ def test_available_roles_point_to_independent_board(env):
 
     assert roles
     assert {r['board'] for r in roles} == {core.INDEPENDENT_ROLE_BOARD}
+
+
+
+def test_ops_independent_role_defaults_to_home_not_repo(env, monkeypatch):
+    core = load_core()
+    source_board = make_board(core, 'source_feature_board', workdir='/tmp/project-repo')
+    captured = []
+    monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: captured.append(meta.get('workdir')) or {'ok': True, 'state': {'thread_id': 'thread', 'tmux_name': 'tmux'}})
+
+    core.open_role_workspace(source_board, 'ops', provider='codex')
+
+    assert captured == [str(Path.home())]

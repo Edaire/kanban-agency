@@ -2018,6 +2018,22 @@ def _ensure_independent_root(conn, board: str, workdir: str | None = None) -> st
     )
 
 
+
+
+def _default_independent_role_workdir(role: str, requested: str | None = None, board_default: str | None = None) -> str:
+    """Resolve workdir for independent role chats.
+
+    Ops is intentionally neutral: it should not inherit a product repo or the
+    kanban-agency plugin repo just because the cockpit was opened there.
+    """
+    if requested:
+        return str(Path(requested).expanduser())
+    if role in {"ops", "operator"}:
+        return str(Path.home())
+    if board_default:
+        return str(Path(board_default).expanduser())
+    return str(Path.home())
+
 def _independent_role_instruction(role: str) -> str:
     return (
         f"这是一个独立 {role} 角色会话，不属于某个 feature workflow。\n"
@@ -2054,7 +2070,8 @@ def _task_exists_for_workspace(board: str, task_id: str | None) -> bool:
         return False
     conn = kb.connect(board=board)
     try:
-        row = conn.execute("SELECT status FROM tasks WHERE id=? AND status != 'archived'", (task_id,)).fetchone()
+        cur = conn.execute("SELECT status FROM tasks WHERE id=? AND status != 'archived'", (task_id,))
+        row = cur.fetchone() if hasattr(cur, "fetchone") else None
         return bool(row)
     finally:
         conn.close()
@@ -2080,14 +2097,14 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
     source_board = board
     board = INDEPENDENT_ROLE_BOARD
     if not kb.board_exists(board):
-        kb.create_board(board, name=INDEPENDENT_ROLE_BOARD_NAME, description="Role-scoped independent chats for kanban-agency", default_workdir=workdir or os.getcwd())
+        kb.create_board(board, name=INDEPENDENT_ROLE_BOARD_NAME, description="Role-scoped independent chats for kanban-agency", default_workdir=str(Path.home()))
     key = _safe_role_key(role)
     state = _sync_role_workspace_exit(board, key, _read_role_workspace_state(board, key))
     if state.get("state") == "active" and _task_exists_for_workspace(board, state.get("task_id")):
         return {"ok": True, "reused": True, "board": board, "source_board": source_board, "role": key, "task_id": state.get("task_id"), "root_id": state.get("root_id"), "url": f"/s/{state.get('task_id')}", "state": state}
 
     meta = kb.read_board_metadata(board)
-    resolved_workdir = workdir or str(meta.get("default_workdir") or "") or os.getcwd()
+    resolved_workdir = _default_independent_role_workdir(key, workdir, str(meta.get("default_workdir") or "") or None)
     role_provider = provider or next((r.get("provider") for r in _available_role_defs(source_board or board) if r.get("role") == key), "codex") or "codex"
     if role_provider not in {"codex", "claude"}:
         role_provider = "codex"
