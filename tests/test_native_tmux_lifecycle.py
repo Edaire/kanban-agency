@@ -140,3 +140,26 @@ def test_run_codex_branch_does_not_call_appserver_runner(env, monkeypatch):
     assert not out['errors']
     assert called['native'] == 1
     assert out['started'][0]['state']['mode'] == 'native-tmux'
+
+
+
+def test_codex_live_ignores_stale_ttyd_without_tmux_or_codex(env, monkeypatch):
+    core = load_core()
+    task_id = 't_stale_ttyd'
+    core._write_json_file(core._codex_web_state_path(task_id), {
+        'provider': 'codex',
+        'pid': 123,
+        'url': 'http://127.0.0.1:9999/',
+        'tmux_name': 'kanban-codex-stale',
+        'thread_id': 'thread-stale',
+    })
+    monkeypatch.setattr(core, '_pid_alive', lambda pid: True)
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: False)
+    monkeypatch.setattr(core.subprocess, 'run', lambda *a, **k: type('CP', (), {'returncode': 1, 'stdout': ''})())
+
+    live = core._codex_native_session_live(task_id, 'thread-stale', require_provider_process=True)
+
+    assert live['ttyd_alive'] is True
+    assert live['tmux_alive'] is False
+    assert live['codex_alive'] is False
+    assert live['live'] is False

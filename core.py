@@ -1369,7 +1369,7 @@ def _process_command_contains(pid: Any, needle: str) -> bool:
     except Exception:
         return False
 
-def _codex_native_session_live(task_id: str, thread_id: str | None = None) -> dict[str, Any]:
+def _codex_native_session_live(task_id: str, thread_id: str | None = None, require_provider_process: bool = False) -> dict[str, Any]:
     state = _read_json_file(_codex_web_state_path(task_id))
     pid = state.get("pid")
     ttyd_alive = bool(pid and _pid_alive(pid))
@@ -1388,8 +1388,21 @@ def _codex_native_session_live(task_id: str, thread_id: str | None = None) -> di
                 codex_alive = bool(codex_pids)
         except Exception:
             pass
-    return {"live": bool(ttyd_alive or codex_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "codex_alive": codex_alive, "codex_pids": codex_pids, "thread_id": thread_id, "url": state.get("url")}
+    live_bool = bool(codex_alive or tmux_alive or (ttyd_alive and not require_provider_process))
+    return {"live": live_bool, "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "codex_alive": codex_alive, "codex_pids": codex_pids, "thread_id": thread_id, "url": state.get("url")}
 
+
+
+
+def _codex_native_session_live_for_status(task_id: str, thread_id: str | None = None) -> dict[str, Any]:
+    try:
+        return _codex_native_session_live(task_id, thread_id, require_provider_process=True)
+    except TypeError:
+        live = _codex_native_session_live(task_id, thread_id)
+        if live.get("ttyd_alive") and not (live.get("tmux_alive") or live.get("codex_alive")):
+            live = dict(live)
+            live["live"] = False
+        return live
 
 def _find_codex_session_file(thread_id: str | None) -> Path | None:
     if not thread_id:
@@ -1997,7 +2010,7 @@ def _claude_session_live(task_id: str) -> dict[str, Any]:
     ttyd_alive = bool(pid and _pid_alive(pid))
     tmux_name = web.get("tmux_name") or web.get("tmux")
     tmux_alive = bool(tmux_name and _tmux_has_session(str(tmux_name)))
-    return {"live": bool(ttyd_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
+    return {"live": bool(tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
 
 def _hermes_session_live(task_id: str) -> dict[str, Any]:
     web = _read_json_file(_hermes_web_state_path(task_id))
@@ -2005,7 +2018,7 @@ def _hermes_session_live(task_id: str) -> dict[str, Any]:
     ttyd_alive = bool(pid and _pid_alive(pid))
     tmux_name = web.get("tmux_name") or web.get("tmux")
     tmux_alive = bool(tmux_name and _tmux_has_session(str(tmux_name)))
-    return {"live": bool(ttyd_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
+    return {"live": bool(tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
 
 
 def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
@@ -2039,7 +2052,7 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
     else:
         web = _read_json_file(_codex_web_state_path(task_id))
         thread_id = web.get('thread_id') or bridge.get('thread_id')
-        live = _codex_native_session_live(task_id, thread_id) if (provider in {None, 'codex'} or thread_id) else {"live": False}
+        live = _codex_native_session_live_for_status(task_id, thread_id) if (provider in {None, 'codex'} or thread_id) else {"live": False}
         pending = _codex_live_pending_approval(thread_id) if thread_id else {"pending": False, "reason": "no_thread"}
     return {
         "ok": True,
@@ -2255,9 +2268,40 @@ def mark_role_workspace_exited(board: str, role: str, reason: str = "explicit ex
     return {"ok": True, "board": board, "role": key, "state": state}
 
 
+
+
+def _role_workspace_provider_live(state: dict[str, Any]) -> bool:
+    task_id = state.get("task_id")
+    provider = state.get("provider") or "codex"
+    if not task_id:
+        return False
+    if provider == "claude":
+        return bool(_claude_session_live(str(task_id)).get("live"))
+    if provider == "hermes":
+        return bool(_hermes_session_live(str(task_id)).get("live"))
+    return bool(_codex_native_session_live_for_status(str(task_id), state.get("thread_id")).get("live"))
+
+
+def _mark_independent_workspace_task_done(board: str, task_id: str | None, reason: str) -> None:
+    if not task_id or not kb.board_exists(board):
+        return
+    conn = kb.connect(board=board)
+    try:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row and row["status"] not in {"done", "archived"}:
+            _set_status(conn, task_id, "done", result=reason)
+            conn.commit()
+    finally:
+        conn.close()
+
 def _sync_role_workspace_exit(board: str, role: str, state: dict[str, Any]) -> dict[str, Any]:
     if state.get("state") == "active" and _thread_has_explicit_exit(state.get("thread_id")):
         state.update({"state": "exited", "exit_reason": "user /exit", "exited_at": int(time.time()), "updated_at": int(time.time())})
+        _mark_independent_workspace_task_done(board, state.get("task_id"), "independent role session exited via /exit")
+        _write_role_workspace_state(board, role, state)
+    elif state.get("state") == "active" and state.get("task_id") and _task_exists_for_workspace(board, state.get("task_id")) and not _role_workspace_provider_live(state):
+        state.update({"state": "exited", "exit_reason": "provider_session_dead", "reason": "provider_session_dead", "exited_at": int(time.time()), "updated_at": int(time.time())})
+        _mark_independent_workspace_task_done(board, state.get("task_id"), "independent role provider session exited")
         _write_role_workspace_state(board, role, state)
     return state
 
@@ -2374,13 +2418,17 @@ def sessions_status(board: str) -> dict[str, Any]:
             role = meta.get('role') or 'unknown'
             st = session_alert_status(board, task.id)
             parents = [dict(r) for r in conn.execute("SELECT p.id,p.title,p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=?", (task.id,)).fetchall()]
-            active_task = task.status not in SKIP_STATUSES
-            is_attention = active_task and (task.status == "blocked" or bool(st.get('pending_approval')))
+            is_independent_session = "@kanban-agency-independent" in (task.body or "")
+            display_status = task.status
+            if is_independent_session and task.status == "running" and not bool(st.get("live")):
+                display_status = "done"
+            active_task = display_status not in SKIP_STATUSES
+            is_attention = active_task and (display_status == "blocked" or bool(st.get('pending_approval')))
             pending_payload = st.get('pending') if active_task else None
             if task.status == "blocked" and (not pending_payload or not pending_payload.get("pending")):
                 pending_payload = {"pending": True, "kind": "blocked", "reason": task.result}
             display_title = _independent_role_display_title(task.id, role) if "@kanban-agency-independent" in (task.body or "") else (task.title or "")
-            return {"role":role,"task_id":task.id,"title":task.title,"display_title":display_title,"task_status":task.status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
+            return {"role":role,"task_id":task.id,"title":task.title,"display_title":display_title,"task_status":display_status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
 
         if board == INDEPENDENT_ROLE_BOARD:
             rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND body LIKE '%@kanban-agency-independent%' ORDER BY created_at DESC,id DESC").fetchall()
