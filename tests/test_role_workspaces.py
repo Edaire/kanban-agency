@@ -154,7 +154,7 @@ def test_available_roles_point_to_independent_board(env):
 
 
 
-def test_ops_independent_role_defaults_to_home_not_repo(env, monkeypatch):
+def test_ops_independent_role_defaults_to_independent_board_workdir(env, monkeypatch):
     core = load_core()
     source_board = make_board(core, 'source_feature_board', workdir='/tmp/project-repo')
     captured = []
@@ -162,4 +162,4 @@ def test_ops_independent_role_defaults_to_home_not_repo(env, monkeypatch):
 
     core.open_role_workspace(source_board, 'ops', provider='codex')
 
-    assert captured == [str(Path.home())]
+    assert captured == [str(Path.home() / 'code' / 'edd' / 'mcps')]

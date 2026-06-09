@@ -42,6 +42,7 @@ ACTIVE_STATUSES = {"todo", "ready", "running", "blocked", "review"}
 SKIP_STATUSES = {"done", "archived"}
 INDEPENDENT_ROLE_BOARD = "kanban_agency_independent_tasks"
 INDEPENDENT_ROLE_BOARD_NAME = "Independent Role Chats"
+INDEPENDENT_ROLE_DEFAULT_WORKDIR = str(Path.home() / "code" / "edd" / "mcps")
 DEFAULT_INDEPENDENT_ROLES = ["researcher", "analyst", "architect", "developer", "tester", "ops", "assistant"]
 ROLE_WORKSPACE_DIR = Path.home() / ".hermes" / "kanban-agency" / "role-workspaces"
 
@@ -2029,10 +2030,10 @@ def _default_independent_role_workdir(role: str, requested: str | None = None, b
     if requested:
         return str(Path(requested).expanduser())
     if role in {"ops", "operator"}:
-        return str(Path.home())
+        return str(Path(board_default or INDEPENDENT_ROLE_DEFAULT_WORKDIR).expanduser())
     if board_default:
         return str(Path(board_default).expanduser())
-    return str(Path.home())
+    return INDEPENDENT_ROLE_DEFAULT_WORKDIR
 
 def _independent_role_instruction(role: str) -> str:
     return (
@@ -2097,7 +2098,7 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
     source_board = board
     board = INDEPENDENT_ROLE_BOARD
     if not kb.board_exists(board):
-        kb.create_board(board, name=INDEPENDENT_ROLE_BOARD_NAME, description="Role-scoped independent chats for kanban-agency", default_workdir=str(Path.home()))
+        kb.create_board(board, name=INDEPENDENT_ROLE_BOARD_NAME, description="Role-scoped independent chats for kanban-agency", default_workdir=INDEPENDENT_ROLE_DEFAULT_WORKDIR)
     key = _safe_role_key(role)
     state = _sync_role_workspace_exit(board, key, _read_role_workspace_state(board, key))
     if state.get("state") == "active" and _task_exists_for_workspace(board, state.get("task_id")):
