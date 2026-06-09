@@ -120,10 +120,10 @@ def test_independent_role_sessions_are_collapsed_and_newest_first(env, monkeypat
         conn.close()
 
     data = core.sessions_status(core.INDEPENDENT_ROLE_BOARD)
-    root = next(r for r in data['roots'] if r['title'] == 'Independent tasks')
+    roots = {r['title']: r for r in data['roots']}
 
-    assert root['collapsed'] is True
-    assert [r['task_id'] for r in root['roles'][:2]] == [second['task_id'], first['task_id']]
+    assert roots['researcher']['roles'][0]['task_id'] == first['task_id']
+    assert roots['developer']['roles'][0]['task_id'] == second['task_id']
 
 
 
@@ -163,3 +163,37 @@ def test_ops_independent_role_defaults_to_independent_board_workdir(env, monkeyp
     core.open_role_workspace(source_board, 'ops', provider='codex')
 
     assert captured == [str(Path.home() / 'code' / 'edd' / 'mcps')]
+
+
+
+def test_independent_role_sessions_group_by_role_not_independent_tasks_root(env, monkeypatch):
+    core = load_core()
+    source_board = make_board(core, 'source_feature_board')
+    monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: {'ok': True, 'state': {'thread_id': 'thread', 'tmux_name': 'tmux'}})
+
+    opened = core.open_role_workspace(source_board, 'researcher')
+    data = core.sessions_status(core.INDEPENDENT_ROLE_BOARD)
+
+    assert not any(r['title'] == 'Independent tasks' for r in data['roots'])
+    root = next(r for r in data['roots'] if r['root_id'] == 'role:researcher')
+    assert root['title'] == 'researcher'
+    assert root['roles'][0]['task_id'] == opened['task_id']
+    assert root['roles'][0]['display_title'] == '等待输入'
+
+
+def test_independent_role_title_uses_first_user_question_summary(env, monkeypatch):
+    core = load_core()
+    source_board = make_board(core, 'source_feature_board')
+    monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: {'ok': True, 'state': {'thread_id': 'thread-abc', 'tmux_name': 'tmux'}})
+    opened = core.open_role_workspace(source_board, 'researcher')
+    session_dir = Path.home() / '.codex' / 'sessions' / '2026' / '06' / '08'
+    session_dir.mkdir(parents=True)
+    (session_dir / 'rollout-thread-abc.jsonl').write_text(
+        '{"type":"event_msg","payload":{"type":"user_message","message":"帮我调研一下 MCP Bundle 在 mcphub 部署的最佳实践，重点看 Python server。"}}\n',
+        encoding='utf-8',
+    )
+
+    data = core.sessions_status(core.INDEPENDENT_ROLE_BOARD)
+    role = next(r for root in data['roots'] for r in root['roles'] if r['task_id'] == opened['task_id'])
+
+    assert role['display_title'].startswith('帮我调研一下 MCP Bundle')

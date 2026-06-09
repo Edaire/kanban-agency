@@ -2044,6 +2044,52 @@ def _independent_role_instruction(role: str) -> str:
     )
 
 
+
+
+def _summarize_user_question(text: str, limit: int = 34) -> str:
+    clean = " ".join((text or "").strip().split())
+    if not clean:
+        return "等待输入"
+    return clean if len(clean) <= limit else clean[:limit].rstrip() + "…"
+
+
+def _first_user_question_for_thread(thread_id: str | None) -> str | None:
+    if not thread_id:
+        return None
+    path = _find_codex_session_file(thread_id)
+    if not path:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        payload = obj.get("payload") or {}
+        if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+            text = str(payload.get("message") or payload.get("text") or payload.get("last_user_message") or "").strip()
+            if text and text != "/exit":
+                return text
+    return None
+
+
+def _independent_role_display_title(task_id: str, role: str) -> str:
+    state = _read_json_file(_codex_web_state_path(task_id))
+    thread_id = state.get("thread_id")
+    if not thread_id:
+        for p in (ROLE_WORKSPACE_DIR / INDEPENDENT_ROLE_BOARD).glob("*.json"):
+            ws = _read_json_file(p)
+            if ws.get("task_id") == task_id:
+                thread_id = ws.get("thread_id")
+                break
+    text = _first_user_question_for_thread(thread_id)
+    if text:
+        return _summarize_user_question(text)
+    return "等待输入"
+
 def _thread_has_explicit_exit(thread_id: str | None) -> bool:
     if not thread_id:
         return False
@@ -2151,8 +2197,8 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
         "task_id": task_id,
         "root_id": root_id,
         "state": "active",
-        "thread_id": web_state.get("thread_id") or web_state.get("session_id"),
-        "tmux_name": web_state.get("tmux_name"),
+        "thread_id": web_state.get("thread_id") or web_state.get("session_id") or (run_result.get("state") or {}).get("thread_id"),
+        "tmux_name": web_state.get("tmux_name") or (run_result.get("state") or {}).get("tmux_name"),
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
     }
@@ -2211,7 +2257,26 @@ def sessions_status(board: str) -> dict[str, Any]:
             pending_payload = st.get('pending') if active_task else None
             if task.status == "blocked" and (not pending_payload or not pending_payload.get("pending")):
                 pending_payload = {"pending": True, "kind": "blocked", "reason": task.result}
-            return {"role":role,"task_id":task.id,"title":task.title,"task_status":task.status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
+            display_title = _independent_role_display_title(task.id, role) if "@kanban-agency-independent" in (task.body or "") else (task.title or "")
+            return {"role":role,"task_id":task.id,"title":task.title,"display_title":display_title,"task_status":task.status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
+
+        if board == INDEPENDENT_ROLE_BOARD:
+            rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND body LIKE '%@kanban-agency-independent%' ORDER BY created_at DESC,id DESC").fetchall()
+            by_role: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                item = role_item(row)
+                by_role.setdefault(str(item.get("role") or "unknown"), []).append(item)
+            for role in sorted(by_role, key=lambda r: DEFAULT_INDEPENDENT_ROLES.index(r) if r in DEFAULT_INDEPENDENT_ROLES else len(DEFAULT_INDEPENDENT_ROLES)):
+                items = by_role[role]
+                roots.append({
+                    "root_id": f"role:{role}",
+                    "title": role,
+                    "status": "running" if any(i.get("task_status") in {"running", "blocked", "ready"} for i in items) else "done",
+                    "collapsed": False,
+                    "attention": sum(1 for i in items if i.get("pending_approval")),
+                    "roles": items,
+                })
+            return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
 
         grouped_task_ids = set()
         for rr in root_rows:
@@ -2318,7 +2383,7 @@ async function openRole(role,b){try{const r=await fetch('/roles/'+encodeURICompo
 function clearDragging(){document.body.classList.remove('dragging')}
 window.addEventListener('mouseup',clearDragging,true);window.addEventListener('pointerup',clearDragging,true);window.addEventListener('blur',clearDragging,true);document.addEventListener('visibilitychange',clearDragging,true);
 function renderRoleSide(){let html='<div class="board-group"><div class="board-title">Roles</div><div class="root open">'; const catalog=roleCatalog(); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const label=rr.role; html+=`<button draggable="true" class="chip role-def ${rr.active?'active':'idle'}" title="Open ${esc(label)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">${rr.active?'●':'○'} ${esc(label)} <span class="small">${rr.active?'active':'idle'}</span></button>`} html+='</div></div>'; return html}
-function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Sessions</div>'; let lastBoard=null; for(const root of sessions.roots){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
+function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Sessions</div>'; let lastBoard=null; for(const root of sessions.roots){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
 function renderSide(){let html=renderRoleSide()+renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
 function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.task_status==='done'&&r.has_session&&r.live)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
