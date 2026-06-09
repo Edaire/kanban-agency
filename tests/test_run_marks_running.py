@@ -66,3 +66,34 @@ def test_claude_interactive_start_marks_ready_task_running(env, monkeypatch):
     assert not result['errors']
     assert result['started'][0]['task_id'] == tid
     assert status_of(core, board, tid) == 'running'
+
+
+
+def test_hermes_native_start_marks_ready_task_running(env, monkeypatch):
+    core = load_core()
+    board = 'run_marks_hermes'
+    tid = make_role_task(core, board, 'hermes')
+    monkeypatch.setattr(core, 'hermes_native_run_task', lambda board, task, meta: {'ok': True, 'state': {'tmux_name': 'tmux'}, 'url': 'http://127.0.0.1:1/'})
+
+    result = core.run(board=board, task_id=tid)
+
+    assert not result['errors']
+    assert result['started'][0]['task_id'] == tid
+    assert result['started'][0]['provider'] == 'hermes'
+    assert status_of(core, board, tid) == 'running'
+
+
+def test_hermes_session_alert_status_uses_hermes_web_state(env, monkeypatch):
+    core = load_core()
+    board = 'hermes_status'
+    tid = make_role_task(core, board, 'hermes')
+    core._write_json_file(core._hermes_web_state_path(tid), {'provider': 'hermes', 'url': 'http://127.0.0.1:7777/', 'pid': 123, 'tmux_name': f'kanban-hermes-{tid}'})
+    monkeypatch.setattr(core, '_pid_alive', lambda pid: pid == 123)
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: name == f'kanban-hermes-{tid}')
+
+    st = core.session_alert_status(board, tid)
+
+    assert st['provider'] == 'hermes'
+    assert st['ttyd_url'] == 'http://127.0.0.1:7777/'
+    assert st['live'] is True
+    assert st['pending_approval'] is False

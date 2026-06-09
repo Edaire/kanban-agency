@@ -420,6 +420,22 @@ def _codex_prompt(task: kb.Task, meta: dict[str, str]) -> str:
     )
 
 
+
+
+def _hermes_prompt(task: kb.Task, meta: dict[str, str]) -> str:
+    role = meta.get('role', 'unknown')
+    root_title = meta.get('root_title') or task.title or ''
+    workdir = meta.get('workdir') or ''
+    rules = _parse_role_rules(task.body)
+    rules_text = "\n".join(f"- {r}" for r in rules) or "- (none)"
+    return (
+        f"你是 kanban-agency 的 {role} 角色。\n"
+        f"工作目录：{workdir}\n"
+        f"工作规则在：\n{rules_text}\n\n"
+        f"当前任务：{root_title}\n\n"
+        "请只完成当前角色职责。需要用户补充信息或审批时停下来提问；完成后停止，等待用户在看板点击 Complete。\n"
+    )
+
 CLAUDE_RUN_DIR = Path.home() / ".hermes" / "kanban-agency" / "claude-runs"
 
 def _claude_state_path(task_id: str) -> Path:
@@ -748,6 +764,71 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
         conn.close()
     return {"ok": True, "reused": False, "state": state, "url": codex_session_url(task.id), "ttyd_url": url, "tmux": str(tmux_name)}
 
+
+
+def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> dict[str, Any]:
+    """Start/attach Hermes CLI in tmux + ttyd for a role task."""
+    if not shutil.which("hermes"):
+        return {"ok": False, "error": "hermes command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
+    cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
+    cwd.mkdir(parents=True, exist_ok=True)
+    state_path = _hermes_web_state_path(task.id)
+    state = _read_json_file(state_path)
+    tmux_name = state.get("tmux_name") or f"kanban-hermes-{task.id}"
+    existing_pid = state.get("pid")
+    if _tmux_has_session(str(tmux_name)) and existing_pid and _pid_alive(existing_pid) and state.get("url"):
+        return {"ok": True, "reused": True, "state": state, "url": state.get("url")}
+
+    HERMES_WEB_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = Path.home() / ".hermes" / "kanban-agency" / "hermes-runs" / task.id / "native-tui"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = run_dir / "prompt.md"
+    prompt_path.write_text(_hermes_prompt(task, meta), encoding="utf-8")
+    started_at = int(time.time())
+    if not _tmux_has_session(str(tmux_name)):
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec hermes"], check=True)
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
+        time.sleep(1.0)
+        subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
+        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
+        subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
+    use_port = _free_port()
+    url = f"http://127.0.0.1:{use_port}/"
+    readonly_port = _free_port()
+    readonly_url = f"http://127.0.0.1:{readonly_port}/"
+    stdout_path = HERMES_WEB_DIR / f"{task.id}.stdout.log"
+    stderr_path = HERMES_WEB_DIR / f"{task.id}.stderr.log"
+    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    out = stdout_path.open("ab"); err = stderr_path.open("ab")
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+    finally:
+        out.close(); err.close()
+    time.sleep(0.5)
+    state = {"task_id": task.id, "board": board, "provider": "hermes", "mode": "native-tmux", "state": "running", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path)}
+    _write_json_file(state_path, state)
+    conn = kb.connect(board=board)
+    try:
+        _mark_running(conn, task.id)
+        kb.add_comment(conn, task.id, author="kanban-agency", body=(
+            "Hermes native tmux session started.\n"
+            f"URL: {codex_session_url(task.id)}\n"
+            f"Direct ttyd: {url}\n"
+            f"tmux: {tmux_name}\n"
+            f"cwd: {cwd}\n"
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "reused": False, "state": state, "url": codex_session_url(task.id), "ttyd_url": url, "tmux": str(tmux_name)}
+
 def run(board: str, listen: str = "ws://127.0.0.1:8795", dry_run: bool = False, task_id: str | None = None) -> dict[str, Any]:
     if not board:
         return {"board": board, "started": [], "reused": [], "skipped": [], "errors": ["--board is required"]}
@@ -785,6 +866,24 @@ def run(board: str, listen: str = "ws://127.0.0.1:8795", dry_run: bool = False, 
                         errors.append(f"claude start failed for {task.id}: {data.get('error')}")
                 except Exception as exc:
                     errors.append(f"claude start failed for {task.id}: {exc}")
+                continue
+            if provider == "hermes":
+                if dry_run:
+                    started.append({"task_id": task.id, "role": role, "provider": provider, "dry_run": True})
+                    continue
+                try:
+                    data = hermes_native_run_task(board, task, meta)
+                    if data.get("ok"):
+                        try:
+                            _mark_running(conn, task.id)
+                        except Exception:
+                            pass
+                        target = reused if data.get("reused") else started
+                        target.append({"task_id": task.id, "role": role, "provider": provider, "state": data.get("state"), "url": data.get("url")})
+                    else:
+                        errors.append(f"hermes native start failed for {task.id}: {data.get('error')}")
+                except Exception as exc:
+                    errors.append(f"hermes native start failed for {task.id}: {exc}")
                 continue
             if provider != "codex":
                 skipped.append({"task_id": task.id, "role": role, "provider": provider, "reason": "unsupported provider in MVP"})
@@ -910,6 +1009,7 @@ def sync(board: str, task_id: str | None = None) -> dict[str, Any]:
 
 
 CODEX_WEB_DIR = Path.home() / ".hermes" / "kanban-agency" / "codex-web"
+HERMES_WEB_DIR = Path.home() / ".hermes" / "kanban-agency" / "hermes-web"
 SESSION_BINDING_DIR = Path.home() / ".hermes" / "kanban-agency" / "session-bindings"
 
 
@@ -940,6 +1040,10 @@ def _write_session_binding(thread_id: str | None, *, task_id: str, board: str | 
 
 def _codex_web_state_path(task_id: str) -> Path:
     return CODEX_WEB_DIR / f"{task_id}.json"
+
+
+def _hermes_web_state_path(task_id: str) -> Path:
+    return HERMES_WEB_DIR / f"{task_id}.json"
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -1891,6 +1995,15 @@ def _claude_session_live(task_id: str) -> dict[str, Any]:
     tmux_alive = bool(tmux_name and _tmux_has_session(str(tmux_name)))
     return {"live": bool(ttyd_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
 
+def _hermes_session_live(task_id: str) -> dict[str, Any]:
+    web = _read_json_file(_hermes_web_state_path(task_id))
+    pid = web.get("pid")
+    ttyd_alive = bool(pid and _pid_alive(pid))
+    tmux_name = web.get("tmux_name") or web.get("tmux")
+    tmux_alive = bool(tmux_name and _tmux_has_session(str(tmux_name)))
+    return {"live": bool(ttyd_alive or tmux_alive), "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "url": web.get("url"), "web_state": web}
+
+
 def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
     """Status payload used by the /s/<task_id> wrapper for tab alerts."""
     provider = None
@@ -1914,6 +2027,11 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
         thread_id = None
         live = _claude_session_live(task_id)
         pending = _claude_attention_status(task_id)
+    elif provider == 'hermes':
+        web = _read_json_file(_hermes_web_state_path(task_id))
+        thread_id = None
+        live = _hermes_session_live(task_id)
+        pending = {"pending": False, "reason": "hermes_no_native_bell_detection"}
     else:
         web = _read_json_file(_codex_web_state_path(task_id))
         thread_id = web.get('thread_id') or bridge.get('thread_id')
@@ -1977,7 +2095,7 @@ def _available_role_defs(board: str) -> list[dict[str, Any]]:
             if key == "default":
                 continue
             keys.append(key)
-            providers[key] = role.provider if role.provider in {"codex", "claude"} else "codex"
+            providers[key] = role.provider if role.provider in {"codex", "claude", "hermes"} else "codex"
     except Exception:
         pass
     for key in DEFAULT_INDEPENDENT_ROLES:
@@ -2153,7 +2271,7 @@ def open_role_workspace(board: str, role: str, provider: str | None = None, work
     meta = kb.read_board_metadata(board)
     resolved_workdir = _default_independent_role_workdir(key, workdir, str(meta.get("default_workdir") or "") or None)
     role_provider = provider or next((r.get("provider") for r in _available_role_defs(source_board or board) if r.get("role") == key), "codex") or "codex"
-    if role_provider not in {"codex", "claude"}:
+    if role_provider not in {"codex", "claude", "hermes"}:
         role_provider = "codex"
     conn = kb.connect(board=board)
     try:
@@ -2225,7 +2343,7 @@ def _auto_advance_board(board: str) -> dict[str, Any]:
         for row in _role_rows(conn):
             task = kb.Task.from_row(row)
             meta = _parse_role_body(task.body)
-            if task.status == "ready" and meta.get("provider") in {"codex", "claude"}:
+            if task.status == "ready" and meta.get("provider") in {"codex", "claude", "hermes"}:
                 ready_ids.append(task.id)
     finally:
         conn.close()
