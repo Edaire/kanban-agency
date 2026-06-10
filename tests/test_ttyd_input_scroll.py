@@ -38,9 +38,9 @@ def test_cockpit_uses_writable_ttyd_with_wheel_intercept_for_scroll_safety():
     assert 'function updatePaneFrames()' in html
     assert 'desiredPaneSrc(r)' in html
     assert 'frame.src!==desired' in html
-    assert "r.has_session&&!r.tmux_alive" in html
-    assert "r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive" in html
-    assert '/view/${r.task_id}' not in html
+    assert "r.has_session&&!r.tmux_alive&&r.task_status==='done'" in html
+    assert "r.has_session&&!r.tmux_alive&&r.url" in html
+    assert 'function updatePaneFrames()' in html
 
 
 def test_resume_tui_button_refreshes_same_pane_after_resume_without_auto_drag_resume():

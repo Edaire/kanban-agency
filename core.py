@@ -654,13 +654,13 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     prompt_path.write_text(_codex_prompt(task, meta), encoding="utf-8")
     started_at = int(time.time())
     if not _tmux_has_session(str(tmux_name)):
-        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec codex"], check=True)
-        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
-        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec codex"], check=True, env=_tmux_env())
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False, env=_tmux_env())
+        subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False, env=_tmux_env())
         time.sleep(1.0)
-        subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
-        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
-        subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
+        subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False, env=_tmux_env())
+        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False, env=_tmux_env())
+        subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False, env=_tmux_env())
         _ensure_prompt_submitted(str(tmux_name), prompt_path)
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
@@ -672,8 +672,8 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
-        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
     finally:
         out.close(); err.close()
     time.sleep(0.5)
@@ -745,8 +745,8 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
-        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
     finally:
         out.close(); err.close()
     time.sleep(0.5)
@@ -813,8 +813,8 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
-        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
     finally:
         out.close(); err.close()
     time.sleep(0.5)
@@ -1110,12 +1110,16 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
         thread_id = str(old.get("thread_id") or bridge.get("thread_id") or "").strip()
         if not thread_id and old.get("mode") == "native-tmux":
             thread_id = _latest_codex_thread_for_cwd(str(old.get("cwd") or ""), int(old.get("started_at") or 0)) or ""
-        if not thread_id:
-            return {"ok": False, "error": f"no codex thread_id for task {task_id}; run provider first", "bridge_state": bridge, "web_state": old}
         meta = _parse_role_body(task.body or "")
         cwd = Path(str(old.get("cwd") or bridge.get("cwd") or meta.get("workdir") or task.workspace_path or os.getcwd())).expanduser()
         if not cwd.exists():
             return {"ok": False, "error": f"cwd does not exist: {cwd}"}
+        if not thread_id and old.get("mode") == "native-tmux" and shutil.which("tmux"):
+            old_tmux = str(old.get("tmux_name") or f"kanban-codex-{task_id}")
+            if not _tmux_has_session(old_tmux):
+                return {"ok": False, "error": f"native Codex session for {task_id} was lost before a thread_id was captured; reflow this role instead of resuming", "task_id": task_id, "cwd": str(cwd), "reason": "lost_native_session_without_thread", "reflow_required": True}
+        if not thread_id:
+            return {"ok": False, "error": f"no codex thread_id for task {task_id}; run provider first", "bridge_state": bridge, "web_state": old}
         if os.environ.get("KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN") in {"1", "true", "yes"}:
             return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task_id, "thread_id": thread_id, "cwd": str(cwd)}
         use_port = int(port or _free_port())
@@ -2422,6 +2426,35 @@ def _auto_advance_board(board: str) -> dict[str, Any]:
             errors.append(f"run {tid} failed: {exc}")
     return {"ok": not errors, "ready_task_ids": ready_ids, "runs": results, "errors": errors}
 
+def create_board_api(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create a kanban board for Cockpit with a required project workdir."""
+    slug = str(payload.get("slug") or "").strip()
+    name = str(payload.get("name") or "").strip() or None
+    workdir = str(payload.get("workdir") or payload.get("default_workdir") or "").strip()
+    if not slug:
+        return {"ok": False, "error": "slug is required"}
+    if not workdir:
+        return {"ok": False, "error": "workdir is required"}
+    if not workdir.startswith("/"):
+        return {"ok": False, "error": "workdir must be an absolute path"}
+    wd = Path(workdir).expanduser()
+    if not wd.exists() or not wd.is_dir():
+        return {"ok": False, "error": f"workdir does not exist or is not a directory: {workdir}"}
+    try:
+        meta = kb.create_board(
+            slug,
+            name=name,
+            description=str(payload.get("description") or "").strip() or None,
+            icon=str(payload.get("icon") or "").strip() or None,
+            color=str(payload.get("color") or "").strip() or None,
+            default_workdir=str(wd),
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "board": meta}
+
+
+
 def sessions_status(board: str) -> dict[str, Any]:
     if not board or not kb.board_exists(board):
         return {"ok": False, "board": board, "roots": [], "error": f"board not found: {board}"}
@@ -2547,8 +2580,12 @@ def sessions_all() -> dict[str, Any]:
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
 *{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:auto;scrollbar-gutter:stable;padding:10px}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
-</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Sessions</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><script>
+</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Sessions</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="boardManager" class="board-manager" style="margin:-4px 0 8px;text-align:right"><button class="layoutBtn" onclick="showBoardDialog()">+ Board</button></div><div id="sessions"></div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="boardDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:360px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New board</h3><label class="small">Title</label><input id="newBoardName" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="e.g. Bhumi/AnalysisClaw"><label class="small">Workdir</label><input id="newBoardWorkdir" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="/Users/admin/code/analysis"><div id="boardMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideBoardDialog()">Cancel</button><button class="layoutBtn" onclick="createBoard()">Create</button></div></div></div><script>
 const board='__BOARD__';const isAll=board==='__all__';let sessions={roots:[]};let sideMode='sessions';let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let lastSideHtml='';let panesRenderedWithData=false;const storageKey='kanban-cockpit-state:'+board;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,sideMode,panes,active,expanded:[...expandedRoots]}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(s.sideMode)sideMode=s.sideMode;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded)}catch(e){}}
+function showBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='flex';setTimeout(()=>document.getElementById('newBoardName')?.focus(),0)}
+function hideBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='none'}
+function slugifyBoardTitle(title){return String(title||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)||('board_'+Date.now())}
+async function createBoard(){const msg=document.getElementById('boardMsg');const name=document.getElementById('newBoardName')?.value.trim();const workdir=document.getElementById('newBoardWorkdir')?.value.trim();const slug=slugifyBoardTitle(name);if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug,name,workdir})});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}if(msg)msg.textContent='Created '+data.board.slug;setTimeout(()=>{location.href='/cockpit/'+encodeURIComponent(data.board.slug)},300)}catch(e){if(msg)msg.textContent=String(e)}}
 const layouts={"1":[1],"2":[1,2],"3":[1,2,3],"2x2":[1,2,4,5],"3x2":[1,2,3,4,5,6],"left-split":[1,4,2,3],"main-side":[1,2,5]};
 function visibleIds(){return layouts[layout]||[1,2,3]}
 function paneIndex(id){return id-1}
@@ -2564,7 +2601,7 @@ function roleCatalog(){return (sessions.available_roles||[]).filter(r=>r&&r.role
 function paneRef(task){const idx=panes.findIndex(x=>x===task);return idx>=0?`<span class="pane-ref">#${idx+1}</span>`:''}
 function rootKey(root){return (root.board||board)+'/'+(root.root_id||root.title)}
 function setLayout(l){layout=l;paneCount=visibleIds().length;saveState();document.getElementById('panes').className='panes layout-'+l;active=visibleIds().includes(active+1)?active:paneIndex(visibleIds()[0]);renderLayouts();renderPanes();}
-function renderLayouts(){document.getElementById('layouts').innerHTML=Object.keys(layouts).map(l=>`<button class="layoutBtn ${l===layout?'active':''}" data-l="${l}">${l}</button>`).join('');document.querySelectorAll('.layoutBtn').forEach(b=>b.onclick=()=>setLayout(b.dataset.l));}
+function renderLayouts(){document.getElementById('layouts').innerHTML=Object.keys(layouts).map(l=>`<button class="layoutBtn ${l===layout?'active':''}" data-l="${l}">${l}</button>`).join('');document.querySelectorAll('#layouts .layoutBtn').forEach(b=>b.onclick=()=>setLayout(b.dataset.l));}
 function pickDefaults(){const roles=allRoles().filter(r=>r.task_id); const ranked=[...roles.filter(r=>r.pending_approval),...roles.filter(r=>r.task_status==='running'&&!r.pending_approval),...roles.filter(r=>r.task_status==='ready'),...roles.filter(r=>r.task_status==='done')]; const ids=[...new Set(ranked.map(r=>r.task_id))]; visibleIds().forEach((id,pos)=>{const i=paneIndex(id); panes[i]=panes[i]||ids[pos]||null;});}
 async function resumeTask(task){const i=panes.findIndex(x=>x===task);const paneIndexToUse=i>=0?i:active;try{const pane=document.querySelector(`.ph[data-pane="${paneIndexToUse}"]`)?.closest('.pane');const body=pane?.querySelector('.body');if(body)body.innerHTML='<div class="placeholder"><h3>Resuming TUI...</h3><p>'+esc(task)+'</p></div>';const resp=await fetch('/resume/'+encodeURIComponent(task),{cache:'no-store'});let data={};try{data=await resp.json()}catch(e){}if(data&&data.ok===false){if(body)body.innerHTML='<div class="placeholder"><h3>Resume failed</h3><pre class="summary">'+esc(JSON.stringify(data,null,2))+'</pre></div>';console.error('resume failed',data);return;}await refresh();replacePaneDom(paneIndexToUse);updatePaneHeaders();updatePaneFrames();setActive(paneIndexToUse);}catch(e){console.error(e)}}
 async function openRole(role,b){try{const r=await fetch('/roles/'+encodeURIComponent(b||board)+'/'+encodeURIComponent(role)+'/open',{cache:'no-store'});const data=await r.json();if(data&&data.ok&&data.task_id){setPane(active,data.task_id);await refresh();}else{console.error('openRole failed',data)}}catch(e){console.error(e)}}
@@ -2576,8 +2613,8 @@ function roleSessionRoots(){return sessions.roots.filter(root=>String(root.root_
 function renderRoleSide(){let html='<div class="board-group"><div class="board-title">Roles</div>'; const catalog=roleCatalog(); const rootsByRole=Object.fromEntries(roleSessionRoots().map(root=>[String(root.root_id||'').replace(/^role:/,''),root])); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const roleSessions=(rootsByRole[rr.role]||{}).roles||[]; html+=`<div class="root open"><div class="root-title open"><span>${rr.active?'●':'○'}</span><span class="root-name">${esc(rr.role)}</span><span class="root-state">${rr.active?'active':'idle'}</span></div>`; html+=`<button draggable="true" class="chip role-def ${rr.active?'active':'idle'}" title="Open ${esc(rr.role)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">＋ new / current <span class="small">${rr.active?'reuse':'init'}</span></button>`; for(const r of roleSessions){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`} html+='</div>'} html+='</div>'; return html}
 function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Sessions</div>'; let lastBoard=null; for(const root of sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:'))){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
 function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
-function desiredPaneSrc(r){if(!r)return ''; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
-function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive)return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
+function desiredPaneSrc(r){if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${r.url}?cockpit=1&t=${Date.now()}`; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
+function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
 function paneHtml(i){const r=rolesById()[panes[i]]; return `<div class="pane ${i===active?'active':''}"><div class="ph" data-pane="${i}"><span class="pane-id">#${i+1}</span>${r?`${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`:`empty`}</div><div class="body">${paneBody(r)}</div></div>`}
 function setActive(i){active=i;document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}
@@ -2610,6 +2647,21 @@ spec = importlib.util.spec_from_file_location('kanban_agency_core_gateway', CORE
 core = importlib.util.module_from_spec(spec); sys.modules[spec.name] = core; spec.loader.exec_module(core)
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): return
+    def _send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False, indent=2).encode()
+        self.send_response(status); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == '/boards':
+            try:
+                length = int(self.headers.get('content-length') or '0')
+                raw = self.rfile.read(length).decode('utf-8') if length else '{{}}'
+                payload = json.loads(raw or '{{}}')
+            except Exception as exc:
+                self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
+            data = core.create_board_api(payload)
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        self.send_response(404); self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ('/', '/healthz'):
@@ -2655,6 +2707,14 @@ class H(BaseHTTPRequestHandler):
             parts = path.strip('/').split('/')
             board = parts[1].strip() if len(parts) > 1 else ''
             body = json.dumps({{"ok": True, "board": board, "available_roles": core._available_role_defs(board)}}, ensure_ascii=False, indent=2).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path == '/boards':
+            boards = []
+            for b in core.kb.list_boards(include_archived=False):
+                item = dict(b)
+                item['default_workdir'] = item.get('default_workdir')
+                boards.append(item)
+            body = json.dumps({{'ok': True, 'boards': boards}}, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/sessions/'):
             board = path.strip('/').split('/', 1)[1].strip()

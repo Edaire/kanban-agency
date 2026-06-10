@@ -105,6 +105,41 @@ def test_codex_web_resume_uses_clean_tmux_env_for_new_session_and_ttyd(monkeypat
     assert conn.closed is True
 
 
+def test_codex_web_reports_reflow_required_when_no_thread_and_tmux_dead(monkeypatch, tmp_path):
+    core = load_core()
+    task_id = 't_no_thread'
+    conn = FakeConn(fake_task_row(task_id))
+    state_path = tmp_path / f'{task_id}.json'
+    old_state = {
+        'mode': 'native-tmux',
+        'thread_id': None,
+        'cwd': str(tmp_path),
+        'tmux_name': 'kanban-codex-t_no_thread',
+        'started_at': 1,
+    }
+
+    monkeypatch.delenv('KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN', raising=False)
+    monkeypatch.setattr(core.shutil, 'which', lambda name: f'/usr/bin/{name}')
+    monkeypatch.setattr(core.kb.Task, 'from_row', lambda row: SimpleNamespace(id=row['id'], body=row['body'], workspace_path=row['workspace_path']))
+    monkeypatch.setattr(core, '_codex_web_state_path', lambda tid: state_path)
+    monkeypatch.setattr(core, '_read_json_file', lambda path: old_state if path == state_path else {})
+    monkeypatch.setattr(core, '_load_bridge_state', lambda tid: {})
+    monkeypatch.setattr(core, '_latest_codex_thread_for_cwd', lambda cwd, since: None)
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: False)
+    monkeypatch.setattr(core.kb, 'connect', lambda board: conn)
+
+    def fail_native(*args, **kwargs):
+        raise AssertionError('must not restart a new prompt when original thread was never captured')
+    monkeypatch.setattr(core, 'codex_native_run_task', fail_native)
+
+    out = core.codex_web('board', task_id, reuse=False)
+
+    assert out['ok'] is False
+    assert out['reflow_required'] is True
+    assert out['reason'] == 'lost_native_session_without_thread'
+    assert conn.closed is True
+
+
 def test_codex_web_spawn_disable_prevents_resume_side_effects(monkeypatch, tmp_path):
     core = load_core()
     task_id = 't_disabled'
