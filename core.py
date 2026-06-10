@@ -488,9 +488,15 @@ def _ensure_claude_ops_settings() -> Path:
     dest.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return dest
 
+def _tmux_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("TMUX", None)
+    return env
+
+
 def _tmux_has_session(name: str) -> bool:
     try:
-        cp = subprocess.run(["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cp = subprocess.run(["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_tmux_env())
         return cp.returncode == 0
     except Exception:
         return False
@@ -1110,6 +1116,8 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
         cwd = Path(str(old.get("cwd") or bridge.get("cwd") or meta.get("workdir") or task.workspace_path or os.getcwd())).expanduser()
         if not cwd.exists():
             return {"ok": False, "error": f"cwd does not exist: {cwd}"}
+        if os.environ.get("KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN") in {"1", "true", "yes"}:
+            return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task_id, "thread_id": thread_id, "cwd": str(cwd)}
         use_port = int(port or _free_port())
         url = f"http://127.0.0.1:{use_port}/"
         CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
@@ -1122,7 +1130,7 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                     "tmux", "new-session", "-d", "-s", tmux_name,
                     "-c", str(cwd),
                     "bash", "-lc", f"exec codex resume {shlex.quote(thread_id)}",
-                ], check=True)
+                ], check=True, env=_tmux_env())
             cmd = [
                 ttyd,
                 "--interface", "127.0.0.1",
@@ -1153,9 +1161,9 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
         out = stdout_path.open("ab")
         err = stderr_path.open("ab")
         try:
-            proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+            proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
             if readonly_url:
-                readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
         finally:
             out.close(); err.close()
         state = {
@@ -1940,15 +1948,15 @@ def tmux_scroll_task(task_id: str, delta: int = -800) -> dict[str, Any]:
         delta_i = -800
     direction = "scroll-up" if delta_i < 0 else "scroll-down"
     steps = max(1, min(20, abs(delta_i) // 80 or 1))
-    subprocess.run(["tmux", "copy-mode", "-e", "-t", tmux_name], check=False)
-    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "-N", str(steps), direction], check=False)
+    subprocess.run(["tmux", "copy-mode", "-e", "-t", tmux_name], check=False, env=_tmux_env())
+    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "-N", str(steps), direction], check=False, env=_tmux_env())
     return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "direction": direction, "steps": steps}
 
 def _tmux_capture_text(tmux_name: str, lines: int = 5000) -> str:
     try:
         return subprocess.check_output([
             "tmux", "capture-pane", "-p", "-J", "-S", f"-{int(lines)}", "-t", str(tmux_name)
-        ], text=True, stderr=subprocess.STDOUT)
+        ], text=True, stderr=subprocess.STDOUT, env=_tmux_env())
     except Exception as exc:
         return f"[capture failed] {exc}"
 
@@ -2299,10 +2307,6 @@ def _sync_role_workspace_exit(board: str, role: str, state: dict[str, Any]) -> d
         state.update({"state": "exited", "exit_reason": "user /exit", "exited_at": int(time.time()), "updated_at": int(time.time())})
         _mark_independent_workspace_task_done(board, state.get("task_id"), "independent role session exited via /exit")
         _write_role_workspace_state(board, role, state)
-    elif state.get("state") == "active" and state.get("task_id") and _task_exists_for_workspace(board, state.get("task_id")) and not _role_workspace_provider_live(state):
-        state.update({"state": "exited", "exit_reason": "provider_session_dead", "reason": "provider_session_dead", "exited_at": int(time.time()), "updated_at": int(time.time())})
-        _mark_independent_workspace_task_done(board, state.get("task_id"), "independent role provider session exited")
-        _write_role_workspace_state(board, role, state)
     return state
 
 
@@ -2548,7 +2552,7 @@ function rootKey(root){return (root.board||board)+'/'+(root.root_id||root.title)
 function setLayout(l){layout=l;paneCount=visibleIds().length;saveState();document.getElementById('panes').className='panes layout-'+l;active=visibleIds().includes(active+1)?active:paneIndex(visibleIds()[0]);renderLayouts();renderPanes();}
 function renderLayouts(){document.getElementById('layouts').innerHTML=Object.keys(layouts).map(l=>`<button class="layoutBtn ${l===layout?'active':''}" data-l="${l}">${l}</button>`).join('');document.querySelectorAll('.layoutBtn').forEach(b=>b.onclick=()=>setLayout(b.dataset.l));}
 function pickDefaults(){const roles=allRoles().filter(r=>r.task_id); const ranked=[...roles.filter(r=>r.pending_approval),...roles.filter(r=>r.task_status==='running'&&!r.pending_approval),...roles.filter(r=>r.task_status==='ready'),...roles.filter(r=>r.task_status==='done')]; const ids=[...new Set(ranked.map(r=>r.task_id))]; visibleIds().forEach((id,pos)=>{const i=paneIndex(id); panes[i]=panes[i]||ids[pos]||null;});}
-async function resumeTask(task){try{await fetch('/resume/'+encodeURIComponent(task),{cache:'no-store'});setPane(active,task);}catch(e){console.error(e)}}
+async function resumeTask(task){const i=panes.findIndex(x=>x===task);const paneIndexToUse=i>=0?i:active;try{const pane=document.querySelector(`.ph[data-pane="${paneIndexToUse}"]`)?.closest('.pane');const body=pane?.querySelector('.body');if(body)body.innerHTML='<div class="placeholder"><h3>Resuming TUI...</h3><p>'+esc(task)+'</p></div>';const resp=await fetch('/resume/'+encodeURIComponent(task),{cache:'no-store'});let data={};try{data=await resp.json()}catch(e){}if(data&&data.ok===false){if(body)body.innerHTML='<div class="placeholder"><h3>Resume failed</h3><pre class="summary">'+esc(JSON.stringify(data,null,2))+'</pre></div>';console.error('resume failed',data);return;}await refresh();replacePaneDom(paneIndexToUse);updatePaneHeaders();updatePaneFrames();setActive(paneIndexToUse);}catch(e){console.error(e)}}
 async function openRole(role,b){try{const r=await fetch('/roles/'+encodeURIComponent(b||board)+'/'+encodeURIComponent(role)+'/open',{cache:'no-store'});const data=await r.json();if(data&&data.ok&&data.task_id){setPane(active,data.task_id);await refresh();}else{console.error('openRole failed',data)}}catch(e){console.error(e)}}
 function clearDragging(){document.body.classList.remove('dragging')}
 window.addEventListener('mouseup',clearDragging,true);window.addEventListener('pointerup',clearDragging,true);window.addEventListener('blur',clearDragging,true);document.addEventListener('visibilitychange',clearDragging,true);
@@ -2559,13 +2563,13 @@ function renderRoleSide(){let html='<div class="board-group"><div class="board-t
 function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Sessions</div>'; let lastBoard=null; for(const root of sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:'))){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
 function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
-function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.task_status==='done'&&r.has_session&&r.live)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
+function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive)return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
 function paneHtml(i){const r=rolesById()[panes[i]]; return `<div class="pane ${i===active?'active':''}"><div class="ph" data-pane="${i}"><span class="pane-id">#${i+1}</span>${r?`${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`:`empty`}</div><div class="body">${paneBody(r)}</div></div>`}
 function setActive(i){active=i;document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}
 function wirePane(pane,i){const h=pane.querySelector('.ph'); if(h)h.onclick=()=>setActive(i); const drop=e=>{e.preventDefault();clearDragging();pane.classList.remove('dropTarget');active=i;const roleRaw=e.dataTransfer.getData('application/x-kanban-agency-role'); if(roleRaw){try{const rr=JSON.parse(roleRaw);openRole(rr.role,rr.board);return;}catch(err){console.error(err)}} const task=e.dataTransfer.getData('text/plain'); if(task)setPane(i,task);}; const over=e=>{e.preventDefault();pane.classList.add('dropTarget')}; const leave=()=>pane.classList.remove('dropTarget'); pane.ondragover=over; pane.ondragleave=leave; pane.ondrop=drop; const b=pane.querySelector('.body'); if(b){b.ondragover=over;b.ondragleave=leave;b.ondrop=drop;}}
 function replacePaneDom(i){const container=document.getElementById('panes');const pos=visibleIds().indexOf(i+1);const old=pos>=0?container.children[pos]:null; if(old){old.outerHTML=paneHtml(i); wirePane(container.children[pos],i);}}
-function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld=panes[i]; if(from>=0&&from!==i){panes[i]=task;panes[from]=targetOld||null;replacePaneDom(i);replacePaneDom(from);} else {panes[i]=task;replacePaneDom(i);} active=i;saveState();setActive(i);renderSide(); if(visibleIds().indexOf(i+1)<0)renderPanes();}
+function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld=panes[i]; if(from>=0&&from!==i){panes[i]=task;panes[from]=targetOld||null;replacePaneDom(i);replacePaneDom(from);} else {panes[i]=task;replacePaneDom(i);} active=i;saveState();setActive(i);renderSide(); if(visibleIds().indexOf(i+1)<0)renderPanes(); updatePaneHeaders(); updatePaneFrames();}
 function renderPanes(){let html=''; for(const id of visibleIds())html+=paneHtml(paneIndex(id)); document.getElementById('panes').innerHTML=html; document.querySelectorAll('.pane').forEach((pane,pos)=>wirePane(pane,paneIndex(visibleIds()[pos])));}
 function updatePaneHeaders(){const roles=rolesById(); document.querySelectorAll('.pane').forEach((pane,pos)=>{const i=Number(pane.querySelector('.ph')?.dataset.pane);const r=roles[panes[i]]; const h=pane.querySelector('.ph'); if(h&&r){const next=`<span class="pane-id">#${i+1}</span>${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`; if(h.dataset.last!==next){h.innerHTML=next;h.dataset.last=next;}}});}
 function updatePaneFrames(){const roles=rolesById();document.querySelectorAll('iframe[data-task]').forEach(frame=>{const r=roles[frame.dataset.task];if(!r||frame.dataset.task!==r.task_id)return;const desired=desiredPaneSrc(r);if(desired&&frame.src!==desired)frame.src=desired;});}
@@ -2700,7 +2704,10 @@ class H(BaseHTTPRequestHandler):
             else:
                 if not board:
                     self.send_response(404); self.end_headers(); self.wfile.write(b'no board for task'); return
-                data = core.codex_web(board, task_id)
+                if core.os.environ.get('KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN') in ('1','true','yes'):
+                    data = {{'ok': True, 'url': 'about:blank', 'spawn_disabled': True}}
+                else:
+                    data = core.codex_web(board, task_id)
             if not data.get('ok'):
                 body = json.dumps(data, ensure_ascii=False, indent=2).encode()
                 self.send_response(500); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return

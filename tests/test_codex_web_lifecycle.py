@@ -23,6 +23,7 @@ def env(tmp_path, monkeypatch):
     hermes.mkdir()
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('HERMES_HOME', str(hermes))
+    monkeypatch.delenv('KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN', raising=False)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 

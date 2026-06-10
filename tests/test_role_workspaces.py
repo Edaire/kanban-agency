@@ -22,6 +22,7 @@ def env(tmp_path, monkeypatch):
     hermes.mkdir()
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('HERMES_HOME', str(hermes))
+    monkeypatch.delenv('KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN', raising=False)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -212,7 +213,7 @@ def test_orchestrator_role_defaults_to_hermes_when_configured(env):
 
 
 
-def test_independent_role_workspace_exits_when_provider_session_dead(env, monkeypatch):
+def test_independent_role_workspace_stays_reusable_when_provider_session_dead(env, monkeypatch):
     core = load_core()
     source_board = make_board(core, 'source_dead_provider')
     monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: {'ok': True, 'state': {'thread_id': 'thread-dead', 'tmux_name': 'tmux-dead'}})
@@ -227,7 +228,7 @@ def test_independent_role_workspace_exits_when_provider_session_dead(env, monkey
 
     roles = {r['role']: r for r in core._available_role_defs(source_board)}
 
-    assert roles['developer']['active'] is False
+    assert roles['developer']['active'] is True
     state = core._read_role_workspace_state(core.INDEPENDENT_ROLE_BOARD, 'developer')
-    assert state['state'] == 'exited'
-    assert state['reason'] == 'provider_session_dead'
+    assert state['state'] == 'active'
+    assert state['task_id'] == opened['task_id']

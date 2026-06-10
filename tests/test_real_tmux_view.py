@@ -20,9 +20,12 @@ def test_task_view_reads_real_tmux_capture_and_escapes_html(tmp_path, monkeypatc
     session = 'kanban-test-view-real'
     marker = 'KANBAN_VIEW_REAL_MARKER_<escaped>&ok'
     import subprocess
-    subprocess.run(['tmux', 'kill-session', '-t', session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import os
+    env = dict(os.environ)
+    env.pop('TMUX', None)
+    subprocess.run(['tmux', 'kill-session', '-t', session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     try:
-        subprocess.run(['tmux', 'new-session', '-d', '-s', session, 'bash', '-lc', f'printf %s {marker!r}; sleep 30'], check=True)
+        subprocess.run(['tmux', 'new-session', '-d', '-s', session, 'bash', '-lc', f'printf %s {marker!r}; sleep 30'], check=True, env=env)
         state_path = core._codex_web_state_path('realview')
         core._write_json_file(state_path, {'tmux_name': session})
         text = core.task_view_text('realview')
@@ -32,4 +35,4 @@ def test_task_view_reads_real_tmux_capture_and_escapes_html(tmp_path, monkeypatc
         assert '&lt;escaped&gt;&amp;ok' in html
         assert '<escaped>&ok' not in html
     finally:
-        subprocess.run(['tmux', 'kill-session', '-t', session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['tmux', 'kill-session', '-t', session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

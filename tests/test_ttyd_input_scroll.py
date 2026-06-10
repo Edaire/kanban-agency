@@ -38,8 +38,29 @@ def test_cockpit_uses_writable_ttyd_with_wheel_intercept_for_scroll_safety():
     assert 'function updatePaneFrames()' in html
     assert 'desiredPaneSrc(r)' in html
     assert 'frame.src!==desired' in html
+    assert "r.has_session&&!r.tmux_alive" in html
+    assert "r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive" in html
     assert '/view/${r.task_id}' not in html
 
+
+def test_resume_tui_button_refreshes_same_pane_after_resume_without_auto_drag_resume():
+    core = load_core()
+    html = core._cockpit_html('__all__')
+    assert 'async function resumeTask' in html
+    assert "panes.findIndex(x=>x===task)" in html
+    assert "fetch('/resume/'+encodeURIComponent(task)" in html
+    assert 'Resuming TUI' in html
+    assert 'Resume failed' in html
+    assert 'replacePaneDom(paneIndexToUse)' in html
+    assert 'continueTaskInPane' not in html
+
+
+def test_gateway_spawn_disable_guard_exists_for_tests():
+    core = load_core()
+    source = Path(core.__file__).read_text()
+    assert 'KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN' in source
+    assert 'provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN' in source
+    assert "'about:blank'" in source
 
 def test_writable_interaction_remains_in_s_route_not_cockpit_observer():
     core = load_core()

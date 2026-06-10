@@ -23,7 +23,7 @@ def test_task_view_html_is_plain_scrollable_observer(monkeypatch):
     core = load_core()
     monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux_name': 'kanban-codex-t1', 'url': 'http://writable/'})
     monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
-    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, text=True, stderr=None: 'line1\nline2\n')
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, **kwargs: 'line1\nline2\n')
     html = core.task_view_html('t1')
     assert '<pre' in html
     assert 'line1' in html
