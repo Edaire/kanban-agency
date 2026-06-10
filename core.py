@@ -1460,6 +1460,20 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
                 pending[call_id] = {"timestamp": obj.get("timestamp"), "call_id": call_id, "name": payload.get("name"), "cmd": args.get("cmd"), "workdir": args.get("workdir"), "justification": args.get("justification"), "session_file": str(path)}
         elif typ == "function_call_output" and call_id:
             pending.pop(call_id, None)
+        elif typ == "custom_tool_call" and call_id:
+            tool_input = payload.get("input") or ""
+            pending[call_id] = {
+                "timestamp": obj.get("timestamp"),
+                "call_id": call_id,
+                "kind": "tool_call_approval_required",
+                "name": payload.get("name"),
+                "cmd": None,
+                "workdir": None,
+                "justification": str(tool_input)[:500],
+                "session_file": str(path),
+            }
+        elif typ == "custom_tool_call_output" and call_id:
+            pending.pop(call_id, None)
         elif obj.get("type") == "event_msg" and payload.get("type") == "task_complete":
             saw_task_complete = True
             last_task_complete = {
