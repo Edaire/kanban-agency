@@ -113,9 +113,10 @@ def test_cockpit_exposes_board_management_controls(env):
     html = core._cockpit_html('__all__')
 
     assert 'id="boardManager"' not in html
-    assert 'Kanbans <span style="float:right" onclick="event.stopPropagation();showBoardDialog()">+</span>' in html
-    assert 'Sessions</button>' not in html
+    assert '<button id="tabSessions" class="sideTab active" onclick="setSideMode(\'sessions\')">Kanbans</button>' in html
     assert 'showBoardDialog()' in html
+    assert 'Kanbans <span style="float:right" onclick="event.stopPropagation();showBoardDialog()">+</span>' not in html
+    assert 'collapsedKanbans' in html
     assert 'id="boardDialog"' in html
     assert 'Title' in html
     assert 'Workdir' in html
