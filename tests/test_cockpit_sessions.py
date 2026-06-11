@@ -66,7 +66,7 @@ def create_root_with_roles(core, board, title, workdir, statuses):
         conn.close()
 
 
-def test_done_role_suppresses_stale_pending_bell(env, monkeypatch):
+def test_done_role_suppresses_provider_pending_bell_after_kanban_acceptance(env, monkeypatch):
     core = load_core()
     board = 'bell_suppression'
     _, roles = create_root_with_roles(core, board, 'Finished feature', '/tmp/work', [('tester', 'done')])
@@ -81,7 +81,8 @@ def test_done_role_suppresses_stale_pending_bell(env, monkeypatch):
     tester = next(r for root in data['roots'] for r in root['roles'] if r.get('task_id') == roles['tester'])
     assert tester['task_status'] == 'done'
     assert tester['pending_approval'] is False
-    assert tester['pending'] is None
+    assert tester['pending']['pending'] is False
+    assert tester['pending']['reason'] == 'completion_acknowledged'
     assert data['roots'][0]['attention'] == 0
 
 
