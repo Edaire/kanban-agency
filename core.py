@@ -503,7 +503,35 @@ def _tmux_env() -> dict[str, str]:
     return env
 
 
+_TMUX_SESSIONS_CACHE: tuple[float, set[str]] = (0.0, set())
+_TMUX_SESSIONS_CACHE_TTL = 0.75
+
+
+def _tmux_session_names() -> set[str]:
+    global _TMUX_SESSIONS_CACHE
+    now = time.time()
+    ts, names = _TMUX_SESSIONS_CACHE
+    if now - ts < _TMUX_SESSIONS_CACHE_TTL:
+        return names
+    try:
+        cp = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            env=_tmux_env(),
+        )
+        names = set((cp.stdout or "").splitlines()) if cp.returncode == 0 else set()
+    except Exception:
+        names = set()
+    _TMUX_SESSIONS_CACHE = (now, names)
+    return names
+
+
 def _tmux_has_session(name: str) -> bool:
+    names = _tmux_session_names()
+    if names:
+        return name in names
     try:
         cp = subprocess.run(["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_tmux_env())
         return cp.returncode == 0
@@ -1390,6 +1418,38 @@ def _process_command_contains(pid: Any, needle: str) -> bool:
     except Exception:
         return False
 
+_CODEX_RESUME_PIDS_CACHE: tuple[float, dict[str, list[int]]] = (0.0, {})
+_CODEX_RESUME_PIDS_CACHE_TTL = 0.75
+
+
+def _codex_resume_pids_by_thread() -> dict[str, list[int]]:
+    global _CODEX_RESUME_PIDS_CACHE
+    now = time.time()
+    ts, cached = _CODEX_RESUME_PIDS_CACHE
+    if now - ts < _CODEX_RESUME_PIDS_CACHE_TTL:
+        return cached
+    out: dict[str, list[int]] = {}
+    try:
+        cp = subprocess.run(["pgrep", "-af", "codex resume"], text=True, capture_output=True, timeout=2)
+        if cp.returncode == 0:
+            for line in (cp.stdout or "").splitlines():
+                parts = line.split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    pid = int(parts[0])
+                except Exception:
+                    continue
+                cmd = parts[1]
+                m = re.search(r"\bcodex\s+resume\s+([^\s]+)", cmd)
+                if m:
+                    out.setdefault(m.group(1), []).append(pid)
+    except Exception:
+        out = {}
+    _CODEX_RESUME_PIDS_CACHE = (now, out)
+    return out
+
+
 def _codex_native_session_live(task_id: str, thread_id: str | None = None, require_provider_process: bool = False) -> dict[str, Any]:
     state = _read_json_file(_codex_web_state_path(task_id))
     pid = state.get("pid")
@@ -1400,15 +1460,9 @@ def _codex_native_session_live(task_id: str, thread_id: str | None = None, requi
     codex_alive = False
     codex_pids: list[int] = []
     if thread_id:
-        try:
-            cp = subprocess.run(["pgrep", "-f", f"codex resume {thread_id}"], text=True, capture_output=True, timeout=2)
-            if cp.returncode == 0:
-                for x in (cp.stdout or "").split():
-                    try: codex_pids.append(int(x))
-                    except Exception: pass
-                codex_alive = bool(codex_pids)
-        except Exception:
-            pass
+        pids_by_thread = _codex_resume_pids_by_thread()
+        codex_pids = list(pids_by_thread.get(thread_id) or [])
+        codex_alive = bool(codex_pids)
     live_bool = bool(codex_alive or tmux_alive or (ttyd_alive and not require_provider_process))
     return {"live": live_bool, "ttyd_alive": ttyd_alive, "ttyd_pid": pid, "tmux_alive": tmux_alive, "tmux_name": tmux_name, "codex_alive": codex_alive, "codex_pids": codex_pids, "thread_id": thread_id, "url": state.get("url")}
 
