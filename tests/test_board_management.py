@@ -112,16 +112,17 @@ def test_cockpit_exposes_board_management_controls(env):
     core = load_core()
     html = core._cockpit_html('__all__')
 
-    assert 'id="boardManager"' in html
-    assert 'side-tabs"><button id="tabSessions"' in html
-    assert '</button></div><div id="boardManager"' in html
-    assert 'id="boardManager"' in html and html.index('id="boardManager"') < html.index('id="sessions"')
+    assert 'id="boardManager"' not in html
+    assert 'Kanbans <span style="float:right" onclick="event.stopPropagation();showBoardDialog()">+</span>' in html
+    assert 'Sessions</button>' not in html
     assert 'showBoardDialog()' in html
     assert 'id="boardDialog"' in html
     assert 'Title' in html
     assert 'Workdir' in html
     assert 'newBoardSlug' not in html
     assert 'createBoard()' in html
+    assert "await refresh();" in html
+    assert "location.href='/cockpit/'+encodeURIComponent(data.board.slug)" not in html
     assert "querySelectorAll('#layouts .layoutBtn')" in html
     assert "querySelectorAll('.layoutBtn')" not in html
     assert "fetch('/boards'" in html

@@ -2455,6 +2455,85 @@ def create_board_api(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def archive_board_api(payload: dict[str, Any]) -> dict[str, Any]:
+    slug = str(payload.get("board") or payload.get("slug") or "").strip()
+    if not slug:
+        return {"ok": False, "error": "board is required"}
+    if not kb.board_exists(slug):
+        return {"ok": False, "error": f"board not found: {slug}"}
+    if slug in {"default", INDEPENDENT_ROLE_BOARD}:
+        return {"ok": False, "error": f"board cannot be archived: {slug}"}
+    meta = kb.write_board_metadata(slug, archived=True)
+    return {"ok": True, "board": meta}
+
+
+
+def create_task_api(board: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Create either a four-role workflow root or a single independent role task."""
+    if not board or not kb.board_exists(board):
+        return {"ok": False, "error": f"board not found: {board}"}
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "title is required"}
+    mode = str(payload.get("mode") or payload.get("type") or "workflow").strip().lower()
+    if mode in {"four-role", "four_role", "flow", "workflow"}:
+        mode = "workflow"
+    elif mode in {"independent", "single", "role"}:
+        mode = "independent"
+    else:
+        return {"ok": False, "error": "mode must be workflow or independent"}
+    body_text = str(payload.get("body") or payload.get("description") or "").strip()
+    workdir, warnings = _resolve_workdir(str(payload.get("workdir") or ""), board)
+    conn = kb.connect(board=board)
+    try:
+        if mode == "workflow":
+            root_body = "@kanban-agency\nworkflow: functional-development\n"
+            if workdir:
+                root_body += f"workdir: {workdir}\n"
+            root_body += "\n" + (body_text or title) + "\n"
+            task_id = kb.create_task(
+                conn,
+                title=title,
+                body=root_body,
+                assignee="kanban-agency",
+                created_by="kanban-agency",
+                workspace_kind="dir" if workdir else "scratch",
+                workspace_path=workdir,
+                initial_status="running",
+            )
+            adv = advance(board, root_id=task_id, dry_run=False)
+            return {"ok": True, "mode": "workflow", "task_id": task_id, "workdir": workdir, "warnings": warnings, "advance": adv}
+        role = str(payload.get("role") or "").strip().lower()
+        if not role:
+            return {"ok": False, "error": "role is required for independent task"}
+        role_defs = {r.get("role"): r for r in _available_role_defs(board)}
+        provider = str(payload.get("provider") or (role_defs.get(role) or {}).get("provider") or "codex")
+        instruction = body_text or title
+        body = "@kanban-agency-role\n"
+        body += f"role: {role}\nprovider: {provider}\nworkdir: {workdir or ''}\nroot_title: {title}\n\n"
+        rules = _role_rules_for(role)
+        body += "rules:\n" + ("\n".join(f"- {r}" for r in rules) if rules else "- (none)") + "\n\n"
+        body += "root_task_body:\n```text\n"
+        body += f"@kanban-agency\nworkdir: {workdir or ''}\n\n{instruction}\n```\n\n"
+        body += "@kanban-agency-independent\nsession_policy: task_scoped\n"
+        task_id = kb.create_task(
+            conn,
+            title=f"[agency] {role}: {title}",
+            body=body,
+            assignee=_agency_assignee(role),
+            created_by="kanban-agency",
+            workspace_kind="dir" if workdir else "scratch",
+            workspace_path=workdir,
+            initial_status="running",
+        )
+        return {"ok": True, "mode": "independent", "task_id": task_id, "role": role, "provider": provider, "workdir": workdir, "warnings": warnings}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+
 def sessions_status(board: str) -> dict[str, Any]:
     if not board or not kb.board_exists(board):
         return {"ok": False, "board": board, "roots": [], "error": f"board not found: {board}"}
@@ -2568,6 +2647,20 @@ def sessions_all() -> dict[str, Any]:
         if active_roots:
             boards.append({"board": slug, "title": board_title, "root_count": len(active_roots)})
             roots.extend(active_roots)
+        else:
+            boards.append({"board": slug, "title": board_title, "root_count": 0})
+            roots.append({
+                "root_id": f"board:{slug}",
+                "board": slug,
+                "board_title": board_title,
+                "title": board_title,
+                "status": "empty",
+                "collapsed": False,
+                "attention": 0,
+                "roles": [],
+                "empty_board": True,
+                "default_workdir": b.get("default_workdir"),
+            })
     primary_board = None
     for root in roots:
         if root.get("attention"):
@@ -2580,12 +2673,19 @@ def sessions_all() -> dict[str, Any]:
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
 *{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:auto;scrollbar-gutter:stable;padding:10px}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
-</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Sessions</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="boardManager" class="board-manager" style="margin:-4px 0 8px;text-align:right"><button class="layoutBtn" onclick="showBoardDialog()">+ Board</button></div><div id="sessions"></div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="boardDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:360px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New board</h3><label class="small">Title</label><input id="newBoardName" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="e.g. Bhumi/AnalysisClaw"><label class="small">Workdir</label><input id="newBoardWorkdir" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="/Users/admin/code/analysis"><div id="boardMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideBoardDialog()">Cancel</button><button class="layoutBtn" onclick="createBoard()">Create</button></div></div></div><script>
+</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans <span style="float:right" onclick="event.stopPropagation();showBoardDialog()">+</span></button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="boardDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:360px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New board</h3><label class="small">Title</label><input id="newBoardName" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="e.g. Bhumi/AnalysisClaw"><label class="small">Workdir</label><input id="newBoardWorkdir" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="/Users/admin/code/analysis"><div id="boardMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideBoardDialog()">Cancel</button><button class="layoutBtn" onclick="createBoard()">Create</button></div></div></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="analyst">analyst</option><option value="architect">architect</option><option value="developer">developer</option><option value="tester">tester</option><option value="ops">ops</option><option value="assistant">assistant</option></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><script>
 const board='__BOARD__';const isAll=board==='__all__';let sessions={roots:[]};let sideMode='sessions';let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let lastSideHtml='';let panesRenderedWithData=false;const storageKey='kanban-cockpit-state:'+board;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,sideMode,panes,active,expanded:[...expandedRoots]}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(s.sideMode)sideMode=s.sideMode;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded)}catch(e){}}
 function showBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='flex';setTimeout(()=>document.getElementById('newBoardName')?.focus(),0)}
 function hideBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='none'}
 function slugifyBoardTitle(title){return String(title||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)||('board_'+Date.now())}
-async function createBoard(){const msg=document.getElementById('boardMsg');const name=document.getElementById('newBoardName')?.value.trim();const workdir=document.getElementById('newBoardWorkdir')?.value.trim();const slug=slugifyBoardTitle(name);if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug,name,workdir})});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}if(msg)msg.textContent='Created '+data.board.slug;setTimeout(()=>{location.href='/cockpit/'+encodeURIComponent(data.board.slug)},300)}catch(e){if(msg)msg.textContent=String(e)}}
+async function createBoard(){const msg=document.getElementById('boardMsg');const name=document.getElementById('newBoardName')?.value.trim();const workdir=document.getElementById('newBoardWorkdir')?.value.trim();const slug=slugifyBoardTitle(name);if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug,name,workdir})});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}if(msg)msg.textContent='Created '+data.board.slug;hideBoardDialog();document.getElementById('newBoardName').value='';document.getElementById('newBoardWorkdir').value='';sideMode='sessions';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
+function syncTaskRoleVisibility(){const wrap=document.getElementById('taskRoleWrap');if(wrap)wrap.style.display=(document.getElementById('newTaskMode')?.value==='independent')?'block':'none'}
+function boardOptionsHtml(selected){return (sessions.boards||[]).map(b=>`<option value="${esc(b.board)}" ${b.board===selected?'selected':''}>${esc(b.title||b.board)}</option>`).join('')}
+function showTaskDialog(b){const el=document.getElementById('taskDialog');const sel=document.getElementById('newTaskBoard');if(sel)sel.innerHTML=boardOptionsHtml(b||board);if(el)el.style.display='flex';syncTaskRoleVisibility();setTimeout(()=>document.getElementById('newTaskTitle')?.focus(),0)}
+function hideTaskDialog(){const el=document.getElementById('taskDialog');if(el)el.style.display='none'}
+async function createTask(){const msg=document.getElementById('taskMsg');const payload={board:document.getElementById('newTaskBoard')?.value,title:document.getElementById('newTaskTitle')?.value.trim(),mode:document.getElementById('newTaskMode')?.value,role:document.getElementById('newTaskRole')?.value,body:document.getElementById('newTaskBody')?.value.trim()};if(msg)msg.textContent='Creating...';try{const r=await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}hideTaskDialog();document.getElementById('newTaskTitle').value='';document.getElementById('newTaskBody').value='';sideMode='sessions';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
+async function archiveBoard(b){if(!b)return;if(!confirm('Archive kanban '+b+'?'))return;try{const r=await fetch('/boards/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({board:b})});const data=await r.json();if(!data.ok){alert(data.error||'Archive failed');return;}panes=panes.map(x=>{const rr=rolesById()[x];return rr&&rr.board===b?null:x});saveState();await refresh();}catch(e){alert(String(e))}}
+function setupArchiveDrop(){const el=document.getElementById('archiveDrop');if(!el)return;el.ondragover=e=>{if(e.dataTransfer.types.includes('application/x-kanban-agency-board')){e.preventDefault();el.style.borderColor='#f59e0b';el.style.color='#fde68a'}};el.ondragleave=()=>{el.style.borderColor='#475569';el.style.color='#94a3b8'};el.ondrop=e=>{const b=e.dataTransfer.getData('application/x-kanban-agency-board');if(!b)return;e.preventDefault();el.style.borderColor='#475569';el.style.color='#94a3b8';archiveBoard(b)}}
 const layouts={"1":[1],"2":[1,2],"3":[1,2,3],"2x2":[1,2,4,5],"3x2":[1,2,3,4,5,6],"left-split":[1,4,2,3],"main-side":[1,2,5]};
 function visibleIds(){return layouts[layout]||[1,2,3]}
 function paneIndex(id){return id-1}
@@ -2611,8 +2711,8 @@ function setSideMode(mode){sideMode=mode==='roles'?'roles':'sessions';saveState(
 function syncSideTabs(){const s=document.getElementById('tabSessions');const r=document.getElementById('tabRoles');if(s)s.classList.toggle('active',sideMode!=='roles');if(r)r.classList.toggle('active',sideMode==='roles')}
 function roleSessionRoots(){return sessions.roots.filter(root=>String(root.root_id||'').startsWith('role:'))}
 function renderRoleSide(){let html='<div class="board-group"><div class="board-title">Roles</div>'; const catalog=roleCatalog(); const rootsByRole=Object.fromEntries(roleSessionRoots().map(root=>[String(root.root_id||'').replace(/^role:/,''),root])); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const roleSessions=(rootsByRole[rr.role]||{}).roles||[]; html+=`<div class="root open"><div class="root-title open"><span>${rr.active?'●':'○'}</span><span class="root-name">${esc(rr.role)}</span><span class="root-state">${rr.active?'active':'idle'}</span></div>`; html+=`<button draggable="true" class="chip role-def ${rr.active?'active':'idle'}" title="Open ${esc(rr.role)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">＋ new / current <span class="small">${rr.active?'reuse':'init'}</span></button>`; for(const r of roleSessions){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`} html+='</div>'} html+='</div>'; return html}
-function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Sessions</div>'; let lastBoard=null; for(const root of sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:'))){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div class="board-title">${esc(b)}</div>`; lastBoard=b;} const key=rootKey(root);const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
-function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
+function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Kanbans <span style="float:right;cursor:pointer" onclick="showTaskDialog(board)">+</span></div>'; let lastBoard=null; for(const root of sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:'))){const b=shortBoard(root); if(b!==lastBoard){if(lastBoard!==null)html+='</div>'; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(root.board||board)}">${esc(b)} <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(root.board||board)}')">+</span></div>`; lastBoard=b;} const key=rootKey(root); if(root.empty_board){html+=`<div class="root open"><div class="root-title open" title="${esc(root.default_workdir||'')}" onclick="location.href='/cockpit/'+encodeURIComponent('${esc(root.board||'')}')"><span>▸</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">empty</span></div></div>`; continue;} const collapsed=root.collapsed&&!expandedRoots.has(key);html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null)html+='</div>'; html+='</div>'; return html}
+function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('[data-board-drag]').forEach(el=>{el.ondragstart=e=>{e.dataTransfer.setData('application/x-kanban-agency-board',el.dataset.boardDrag);document.body.classList.add('dragging')};el.ondragend=clearDragging}); document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root; if(expandedRoots.has(k))expandedRoots.delete(k); else expandedRoots.add(k); saveState(); renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=()=>{if(b.dataset.role){openRole(b.dataset.role,b.dataset.board);return;} if(!b.dataset.task)return; setPane(active,b.dataset.task);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${r.url}?cockpit=1&t=${Date.now()}`; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
 function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
@@ -2624,7 +2724,7 @@ function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld
 function renderPanes(){let html=''; for(const id of visibleIds())html+=paneHtml(paneIndex(id)); document.getElementById('panes').innerHTML=html; document.querySelectorAll('.pane').forEach((pane,pos)=>wirePane(pane,paneIndex(visibleIds()[pos])));}
 function updatePaneHeaders(){const roles=rolesById(); document.querySelectorAll('.pane').forEach((pane,pos)=>{const i=Number(pane.querySelector('.ph')?.dataset.pane);const r=roles[panes[i]]; const h=pane.querySelector('.ph'); if(h&&r){const next=`<span class="pane-id">#${i+1}</span>${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`; if(h.dataset.last!==next){h.innerHTML=next;h.dataset.last=next;}}});}
 function updatePaneFrames(){const roles=rolesById();document.querySelectorAll('iframe[data-task]').forEach(frame=>{const r=roles[frame.dataset.task];if(!r||frame.dataset.task!==r.task_id)return;const desired=desiredPaneSrc(r);if(desired&&frame.src!==desired)frame.src=desired;});}
-async function refresh(){try{const r=await fetch(isAll?'/sessions':'/sessions/'+encodeURIComponent(board),{cache:'no-store'});sessions=await r.json();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
+async function refresh(){try{const r=await fetch(isAll?'/sessions':'/sessions/'+encodeURIComponent(board),{cache:'no-store'});sessions=await r.json();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); setupArchiveDrop(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
 loadState();if(!layouts[layout])layout='3';paneCount=visibleIds().length;renderLayouts();document.getElementById('panes').className='panes layout-'+layout;setInterval(refresh,3000);refresh();
 </script></body></html>"""
     return html.replace("__BOARD__", board).replace("__EMBED__", "hiddenHead" if embed else "")
@@ -2660,6 +2760,25 @@ class H(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
             data = core.create_board_api(payload)
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path == '/tasks':
+            try:
+                length = int(self.headers.get('content-length') or '0')
+                raw = self.rfile.read(length).decode('utf-8') if length else '{{}}'
+                payload = json.loads(raw or '{{}}')
+            except Exception as exc:
+                self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
+            board = str(payload.get('board') or '').strip()
+            data = core.create_task_api(board, payload)
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path == '/boards/archive':
+            try:
+                length = int(self.headers.get('content-length') or '0')
+                raw = self.rfile.read(length).decode('utf-8') if length else '{{}}'
+                payload = json.loads(raw or '{{}}')
+            except Exception as exc:
+                self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
+            data = core.archive_board_api(payload)
             self._send_json(data, status=200 if data.get('ok') else 400); return
         self.send_response(404); self.end_headers()
     def do_GET(self):
