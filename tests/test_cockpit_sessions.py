@@ -129,12 +129,16 @@ def test_sessions_all_includes_independent_role_tasks(env):
     independent_roots = [r for r in data['roots'] if r.get('root_id') == '__independent__']
     assert independent_roots
     assert any(role.get('task_id') == task for root in independent_roots for role in root['roles'])
+    assert data['available_roles']
+    assert any(role.get('role') == 'developer' for role in data['available_roles'])
+    assert all(role.get('board') == core.INDEPENDENT_ROLE_BOARD for role in data['available_roles'])
 
 
 def test_cockpit_html_has_drag_swap_resume_and_global_fetch(env):
     core = load_core()
     html = core._cockpit_html('__all__')
-    assert "fetch(isAll?'/sessions'" in html
+    assert "fetch('/sessions'" in html
+    assert "fetch(isAll?'/sessions'" not in html
     assert 'const from=panes.findIndex' in html
     assert 'replacePaneDom(from)' in html
     assert 'resumeTask' in html

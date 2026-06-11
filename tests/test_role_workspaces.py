@@ -93,14 +93,17 @@ def test_cockpit_html_contains_role_drag_support(env):
 
 
 
-def test_sessions_all_does_not_repeat_role_catalog_per_board(env):
+def test_sessions_all_exposes_single_global_role_catalog(env):
     core = load_core()
     make_board(core, 'board_one')
     make_board(core, 'board_two')
 
     data = core.sessions_all()
 
-    assert data['available_roles'] == []
+    roles = data['available_roles']
+    assert roles
+    assert {r['role'] for r in roles} >= {'developer', 'tester', 'ops', 'researcher'}
+    assert {r['board'] for r in roles} == {core.INDEPENDENT_ROLE_BOARD}
 
 
 

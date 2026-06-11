@@ -114,16 +114,12 @@ def test_cockpit_exposes_board_management_controls(env):
 
     assert 'id="boardManager"' not in html
     assert '<button id="tabSessions" class="sideTab active" onclick="setSideMode(\'sessions\')">Kanbans</button>' in html
-    assert 'showBoardDialog()' in html
+    assert 'showBoardDialog()' not in html
     assert 'Kanbans <span style="float:right" onclick="event.stopPropagation();showBoardDialog()">+</span>' not in html
     assert 'collapsedKanbans' in html
-    assert 'id="boardDialog"' in html
-    assert 'Title' in html
-    assert 'Workdir' in html
+    assert 'id="boardDialog"' not in html
     assert 'newBoardSlug' not in html
-    assert 'createBoard()' in html
-    assert "await refresh();" in html
+    assert 'createBoard()' not in html
     assert "location.href='/cockpit/'+encodeURIComponent(data.board.slug)" not in html
     assert "querySelectorAll('#layouts .layoutBtn')" in html
     assert "querySelectorAll('.layoutBtn')" not in html
-    assert "fetch('/boards'" in html

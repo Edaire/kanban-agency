@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import pytest
@@ -105,9 +106,9 @@ def test_gateway_routes_status_sessions_cockpit_and_s(env):
         assert 'Session Cockpit' in body
         assert 'r.ttyd_url||r.url' in body
 
-        status, body = http_get(port, f'/cockpit/{board}')
-        assert status == 200
-        assert 'Session Cockpit' in body
+        with pytest.raises(HTTPError) as exc:
+            http_get(port, f'/cockpit/{board}')
+        assert exc.value.code == 404
 
         status, body = http_get(port, f'/status/{task_id}')
         assert status == 200
