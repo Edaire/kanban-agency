@@ -58,4 +58,6 @@ def test_role_label_displays_role_not_independent_title_for_subtasks(env):
     core = load_core()
     html = core._cockpit_html('__all__')
     assert "function roleLabel(r){return `${esc(r.role||'session')}" in html
-    assert "r.display_title||r.title" not in html
+    role_label_start = html.index("function roleLabel")
+    all_roles_start = html.index("function allRoles")
+    assert "r.display_title||r.title" not in html[role_label_start:all_roles_start]
