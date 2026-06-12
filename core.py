@@ -641,8 +641,15 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
         return {"ok": False, "error": "tmux command not found"}
     state = _read_claude_state(task.id)
     existing_web = _read_json_file(_claude_web_state_path(task.id))
-    if existing_web.get("pid") and _pid_alive(existing_web.get("pid")) and existing_web.get("url") and _url_ok(str(existing_web.get("url"))):
+    existing_tmux = existing_web.get("tmux") or existing_web.get("tmux_name")
+    existing_ttyd_ok = bool(existing_web.get("pid") and _pid_alive(existing_web.get("pid")) and existing_web.get("url") and _url_ok(str(existing_web.get("url"))))
+    if existing_ttyd_ok and (not existing_tmux or _tmux_has_session(str(existing_tmux))):
         return {"ok": True, "reused": True, "state": state or existing_web, "url": existing_web.get("url")}
+    if existing_ttyd_ok and existing_tmux and not _tmux_has_session(str(existing_tmux)):
+        try:
+            os.kill(int(existing_web.get("pid")), signal.SIGTERM)
+        except Exception:
+            pass
     cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     d = CLAUDE_RUN_DIR / task.id; d.mkdir(parents=True, exist_ok=True)
@@ -2008,8 +2015,15 @@ def claude_web(board: str | None, task_id: str, port: int | None = None, reuse: 
     CLAUDE_WEB_DIR.mkdir(parents=True, exist_ok=True)
     state_path = _claude_web_state_path(task_id)
     existing = _read_json_file(state_path)
-    if reuse and existing.get("pid") and _pid_alive(existing.get("pid")) and existing.get("url") and _url_ok(str(existing.get("url"))):
+    existing_tmux = existing.get("tmux") or existing.get("tmux_name")
+    existing_ttyd_ok = bool(existing.get("pid") and _pid_alive(existing.get("pid")) and existing.get("url") and _url_ok(str(existing.get("url"))))
+    if reuse and existing_ttyd_ok and (not existing_tmux or _tmux_has_session(str(existing_tmux))):
         return {"ok": True, "reused": True, "url": existing.get("url"), "state": existing}
+    if existing_ttyd_ok and existing_tmux and not _tmux_has_session(str(existing_tmux)):
+        try:
+            os.kill(int(existing.get("pid")), signal.SIGTERM)
+        except Exception:
+            pass
     if not session_id:
         tmux_name = state.get("tmux")
         if tmux_name and _tmux_has_session(str(tmux_name)) and cwd:
@@ -2394,7 +2408,37 @@ def _first_user_question_for_thread(thread_id: str | None) -> str | None:
     return None
 
 
-def _independent_role_display_title(task_id: str, role: str) -> str:
+def _clean_independent_title(title: str | None, role: str = "") -> str:
+    text = str(title or "").strip()
+    if text.startswith("[agency]"):
+        text = re.sub(r"^\[agency\]\s+[^:]+:\s*", "", text).strip()
+    if not text or text == "independent chat":
+        return "空白会话"
+    return text
+
+
+def _summary_title_from_result(result: str | None) -> str | None:
+    text = " ".join(str(result or "").strip().split())
+    if not text or text == "independent role provider session exited":
+        return None
+    if text.startswith("Claude interactive tmux session started"):
+        return "Claude 交互会话"
+    if "文件抽屉" in text or "右侧工作区分栏" in text:
+        return "文件抽屉改为右侧工作区分栏"
+    if "submodule" in text or ".gitmodules" in text:
+        return "修复 submodule/.gitmodules CI 问题"
+    if "Hindsight" in text and "Hermes" in text:
+        return "调研 Hermes 与 Hindsight 关系"
+    return text[:34].rstrip() + ("…" if len(text) > 34 else "")
+
+
+def _independent_role_display_title(task_id: str, role: str, task_title: str | None = None, result: str | None = None) -> str:
+    cleaned = _clean_independent_title(task_title, role)
+    if cleaned != "空白会话":
+        return cleaned
+    summarized = _summary_title_from_result(result)
+    if summarized:
+        return summarized
     state = _read_json_file(_codex_web_state_path(task_id))
     thread_id = state.get("thread_id")
     if not thread_id:
@@ -2403,10 +2447,15 @@ def _independent_role_display_title(task_id: str, role: str) -> str:
             if ws.get("task_id") == task_id:
                 thread_id = ws.get("thread_id")
                 break
+    pending = _codex_live_pending_approval(thread_id) if thread_id else {}
+    summarized = _summary_title_from_result(pending.get("last_agent_message"))
+    if summarized:
+        return summarized
     text = _first_user_question_for_thread(thread_id)
-    if text:
+    if text and not text.strip().startswith("你是一个"):
         return _summarize_user_question(text)
-    return "等待输入"
+    return "空白会话"
+
 
 def _thread_has_explicit_exit(thread_id: str | None) -> bool:
     if not thread_id:
@@ -2675,24 +2724,21 @@ def sessions_status(board: str) -> dict[str, Any]:
             is_attention = display_status == "blocked" or bool(st.get('pending_approval'))
             if task.status == "blocked" and (not pending_payload or not pending_payload.get("pending")):
                 pending_payload = {"pending": True, "kind": "blocked", "reason": task.result}
-            display_title = _independent_role_display_title(task.id, role) if "@kanban-agency-independent" in (task.body or "") else (task.title or "")
-            return {"role":role,"task_id":task.id,"title":task.title,"display_title":display_title,"task_status":display_status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
+            display_title = _independent_role_display_title(task.id, role, task.title, task.result) if "@kanban-agency-independent" in (task.body or "") else (task.title or "")
+            return {"role":role,"task_id":task.id,"title":task.title,"display_title":display_title,"independent":is_independent_session,"task_status":display_status,"result":task.result,"assignee":task.assignee,"created_at":task.created_at,"url":f"/s/{task.id}","pending_approval":is_attention,"live":bool(st.get('live')),"tmux_alive":bool(st.get('tmux_alive')),"ttyd_alive":bool(st.get('ttyd_alive')),"thread_id":st.get('thread_id'),"ttyd_url":st.get('ttyd_url'),"readonly_ttyd_url":st.get('readonly_ttyd_url'),"has_session":bool(st.get('thread_id') or st.get('ttyd_url') or st.get('tmux_name')),"pending":pending_payload,"parents":parents,"parents_satisfied":_parents_satisfied(conn, task.id)}
 
         if board == INDEPENDENT_ROLE_BOARD:
             rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND body LIKE '%@kanban-agency-independent%' ORDER BY created_at DESC,id DESC").fetchall()
-            by_role: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 item = role_item(row)
-                by_role.setdefault(str(item.get("role") or "unknown"), []).append(item)
-            for role in sorted(by_role, key=lambda r: DEFAULT_INDEPENDENT_ROLES.index(r) if r in DEFAULT_INDEPENDENT_ROLES else len(DEFAULT_INDEPENDENT_ROLES)):
-                items = by_role[role]
                 roots.append({
-                    "root_id": f"role:{role}",
-                    "title": role,
-                    "status": "running" if any(i.get("task_status") in {"running", "blocked", "ready"} for i in items) else "done",
-                    "collapsed": False,
-                    "attention": sum(1 for i in items if i.get("pending_approval")),
-                    "roles": items,
+                    "root_id": item.get("task_id"),
+                    "title": item.get("display_title") or item.get("title") or "独立任务",
+                    "status": item.get("task_status") or "running",
+                    "collapsed": item.get("task_status") in {"done", "archived"},
+                    "attention": 1 if item.get("pending_approval") else 0,
+                    "roles": [item],
+                    "independent": True,
                 })
             return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
 
@@ -2720,13 +2766,25 @@ def sessions_status(board: str) -> dict[str, Any]:
             roots.append({"root_id":root.id,"title":root.title,"status":root.status,"collapsed":collapsed,"attention":sum(1 for r in roles if r.get('pending_approval')),"roles":roles})
 
         independent_rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND (body NOT LIKE '%root_id:%' OR body IS NULL) ORDER BY created_at DESC,id DESC").fetchall()
-        independent_roles = []
+        orphan_roles = []
         for row in independent_rows:
             item = role_item(row)
-            if item.get('task_id') not in grouped_task_ids:
-                independent_roles.append(item)
-        if independent_roles:
-            roots.append({"root_id":"__independent__","title":"Independent tasks","status":"running","collapsed":True,"attention":sum(1 for r in independent_roles if r.get('pending_approval')),"roles":independent_roles})
+            if item.get('task_id') in grouped_task_ids:
+                continue
+            if item.get("independent"):
+                roots.append({
+                    "root_id": item.get("task_id"),
+                    "title": item.get("display_title") or item.get("title") or "独立任务",
+                    "status": item.get("task_status") or "running",
+                    "collapsed": item.get("task_status") in {"done", "archived"},
+                    "attention": 1 if item.get("pending_approval") else 0,
+                    "roles": [item],
+                    "independent": True,
+                })
+            else:
+                orphan_roles.append(item)
+        if orphan_roles:
+            roots.append({"root_id":"__independent__","title":"Independent tasks","status":"running","collapsed":True,"attention":sum(1 for r in orphan_roles if r.get('pending_approval')),"roles":orphan_roles})
         return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
     finally:
         conn.close()
@@ -2790,7 +2848,7 @@ def sessions_all() -> dict[str, Any]:
 
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
-*{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:auto;scrollbar-gutter:stable;padding:10px}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
+*{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:auto;scrollbar-gutter:stable;padding:10px}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr);grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.st{display:inline-block;width:1.15em;margin-right:4px;font-weight:800;text-align:center}.st-attention{color:#f59e0b}.st-blocked{color:#fb7185}.st-running{color:#38bdf8}.st-ready{color:#a78bfa}.st-review{color:#fbbf24}.st-todo{color:#94a3b8}.st-done{color:#22c55e}.st-idle{color:#64748b}.st-missing{color:#475569}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
 </style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="analyst">analyst</option><option value="architect">architect</option><option value="developer">developer</option><option value="tester">tester</option><option value="ops">ops</option><option value="assistant">assistant</option></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><script>
 const storageKey='kanban-cockpit-state';let sessions={roots:[]};let sideMode='sessions';let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let collapsedRoots=new Set();let collapsedKanbans=new Set();let lastSideHtml='';let panesRenderedWithData=false;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,sideMode,panes,active,expanded:[...expandedRoots],collapsedRoots:[...collapsedRoots],collapsedKanbans:[...collapsedKanbans]}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(s.sideMode)sideMode=s.sideMode;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded);if(Array.isArray(s.collapsedRoots))collapsedRoots=new Set(s.collapsedRoots);if(Array.isArray(s.collapsedKanbans))collapsedKanbans=new Set(s.collapsedKanbans)}catch(e){}}
 function syncTaskRoleVisibility(){const wrap=document.getElementById('taskRoleWrap');if(wrap)wrap.style.display=(document.getElementById('newTaskMode')?.value==='independent')?'block':'none'}
@@ -2807,13 +2865,15 @@ function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function displayStatus(r){return r&&r.task_status==='done'?'idle':(r&&r.task_status)||'missing'}
 function shortBoard(root){const b=root.board||''; const t=root.board_title||''; return (t||b).replace(/^Kanban Agency /,'').replace(/^kanban-agency-/,'').replace(/^kanban_agency_/,'').replace(/_/g,'-').slice(0,22)}
 function shortRoot(root){let t=(root.title||'').replace(/^.*?\/\s*/,'').replace(/^\[(feature|bugfix)\]\s*/i,'').replace(/^需求分析师[：:]\s*梳理\s*/,'').replace(/需求$/,'').trim(); if(/历史会话/.test(t))return '历史会话'; if(/UI\s*风格/.test(t))return 'UI 风格调整'; if(/Docker|部署/.test(t))return 'Docker 部署'; if(/slug|离职|归属/.test(t))return 'slug 归属迁移'; if(/BFF.*demo|后端 demo/.test(t))return 'BFF demo'; if(t==='Independent tasks')return '独立任务'; return t.length>24?t.slice(0,23)+'…':t}
-function rootBadge(root){if(root.attention)return `🔔 ${root.attention}`; const roles=(root.roles||[]).filter(r=>r.task_id); if(roles.length&&roles.every(r=>r.task_status==='done'))return '✓ done'; if(roles.some(r=>r.task_status==='running'))return '●'; return root.status||''}
-function sym(s,p){if(p)return '🔔'; if(s==='done')return '✓'; if(s==='running')return '●'; if(s==='ready')return '◇'; if(s==='todo')return '○'; return '·'}
+function statusIcon(s,p){if(p)return '<span class="st st-attention" title="needs attention">🔔</span>'; if(s==='blocked')return '<span class="st st-blocked" title="blocked">◆</span>'; if(s==='running')return '<span class="st st-running" title="running">●</span>'; if(s==='ready')return '<span class="st st-ready" title="ready">◇</span>'; if(s==='review')return '<span class="st st-review" title="review">◐</span>'; if(s==='todo')return '<span class="st st-todo" title="todo">○</span>'; if(s==='done')return '<span class="st st-done" title="done">✓</span>'; if(s==='missing')return '<span class="st st-missing" title="missing">?</span>'; return '<span class="st st-idle" title="idle">·</span>'}
+function rootBadge(root){if(root.attention)return statusIcon(null,true); const roles=(root.roles||[]).filter(r=>r.task_id); if(roles.length&&roles.every(r=>r.task_status==='done'))return statusIcon('done',false); if(roles.some(r=>r.pending_approval))return statusIcon(null,true); if(roles.some(r=>r.task_status==='blocked'))return statusIcon('blocked',false); if(roles.some(r=>r.task_status==='running'))return statusIcon('running',false); if(roles.some(r=>r.task_status==='ready'))return statusIcon('ready',false); return statusIcon(root.status||'idle',false)}
+function sym(s,p){return statusIcon(s,p)}
 function cls(r){if(r.pending_approval)return 'blocked'; return r.task_status||'missing'}
+function roleLabel(r){return `${esc(r.role||'session')}${paneRef(r.task_id)}`}
 function allRoles(){return sessions.roots.flatMap(root=>root.roles.map(role=>Object.assign({},role,{root_title:root.title,root_id:root.root_id})))}
 function roleCatalog(){return (sessions.available_roles||[]).filter(r=>r&&r.role&&r.board)}
 function paneRef(task){const idx=panes.findIndex(x=>x===task);return idx>=0?`<span class="pane-ref">#${idx+1}</span>`:''}
-function rootKey(root){return (root.board||board)+'/'+(root.root_id||root.title)}
+function rootKey(root){return (root.board||'')+'/'+(root.root_id||root.title)}
 function setLayout(l){layout=l;paneCount=visibleIds().length;saveState();document.getElementById('panes').className='panes layout-'+l;active=visibleIds().includes(active+1)?active:paneIndex(visibleIds()[0]);renderLayouts();renderPanes();}
 function renderLayouts(){document.getElementById('layouts').innerHTML=Object.keys(layouts).map(l=>`<button class="layoutBtn ${l===layout?'active':''}" data-l="${l}">${l}</button>`).join('');document.querySelectorAll('#layouts .layoutBtn').forEach(b=>b.onclick=()=>setLayout(b.dataset.l));}
 function pickDefaults(){const roles=allRoles().filter(r=>r.task_id); const ranked=[...roles.filter(r=>r.pending_approval),...roles.filter(r=>r.task_status==='running'&&!r.pending_approval),...roles.filter(r=>r.task_status==='ready'),...roles.filter(r=>r.task_status==='done')]; const ids=[...new Set(ranked.map(r=>r.task_id))]; visibleIds().forEach((id,pos)=>{const i=paneIndex(id); panes[i]=panes[i]||ids[pos]||null;});}
@@ -2827,11 +2887,11 @@ function roleAttention(){return sessions.roots.filter(root=>String(root.root_id|
 function kanbanAttention(){return sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:')).reduce((a,x)=>a+(x.attention||0),0)}
 function syncSideTabs(){const s=document.getElementById('tabSessions');const r=document.getElementById('tabRoles');const ka=kanbanAttention();const ra=roleAttention();if(s){s.innerHTML='Kanbans'+(ka?` 🔔 ${ka}`:'');s.classList.toggle('active',sideMode!=='roles')}if(r){r.innerHTML='Roles'+(ra?` 🔔 ${ra}`:'');r.classList.toggle('active',sideMode==='roles')}}
 function roleSessionRoots(){return sessions.roots.filter(root=>String(root.root_id||'').startsWith('role:'))}
-function renderRoleSide(){let html='<div class="board-group"><div class="board-title">Roles</div>'; const catalog=roleCatalog(); const rootsByRole=Object.fromEntries(roleSessionRoots().map(root=>[String(root.root_id||'').replace(/^role:/,''),root])); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const roleRoot=rootsByRole[rr.role]||{};const roleSessions=roleRoot.roles||[];const att=roleRoot.attention||0; html+=`<div class="root open"><div class="root-title open"><span>${att?'🔔':(rr.active?'●':'○')}</span><span class="root-name">${esc(rr.role)}</span><span class="root-state">${att?('🔔 '+att):(rr.active?'active':'idle')}</span></div>`; html+=`<button draggable="true" class="chip role-def ${rr.active?'active':'idle'}" title="Open ${esc(rr.role)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">＋ new / current <span class="small">${rr.active?'reuse':'init'}</span></button>`; for(const r of roleSessions){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`} html+='</div>'} html+='</div>'; return html}
-function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Kanbans</div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:'))){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${esc(rootBadge(root))}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
+function renderRoleSide(){let html='<div class="board-group"><div class="board-title">Roles</div>'; const catalog=roleCatalog(); const rootsByRole=Object.fromEntries(roleSessionRoots().map(root=>[String(root.root_id||'').replace(/^role:/,''),root])); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const roleRoot=rootsByRole[rr.role]||{};const roleSessions=roleRoot.roles||[];const att=roleRoot.attention||0; html+=`<div class="root open"><div class="root-title open"><span>${att?'🔔':(rr.active?'●':'○')}</span><span class="root-name">${esc(rr.role)}</span><span class="root-state">${att?('🔔 '+att):(rr.active?'active':'idle')}</span></div>`; html+=`<button draggable="true" class="chip role-def ${rr.active?'active':'idle'}" title="Open ${esc(rr.role)} independent chat" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}">＋ new / current <span class="small">${rr.active?'reuse':'init'}</span></button>`; for(const r of roleSessions){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`} html+='</div>'} html+='</div>'; return html}
+function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Kanbans</div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
 function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('[data-board-drag]').forEach(el=>{el.onclick=e=>{if(e.target&&e.target.tagName==='SPAN')return;const b=el.dataset.kanban||el.dataset.boardDrag;if(collapsedKanbans.has(b))collapsedKanbans.delete(b);else collapsedKanbans.add(b);saveState();lastSideHtml='';renderSide()};el.ondragstart=e=>{e.dataTransfer.setData('application/x-kanban-agency-board',el.dataset.boardDrag);document.body.classList.add('dragging')};el.ondragend=clearDragging}); document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root;const def=el.dataset.defaultCollapsed==='1';const collapsed=collapsedRoots.has(k)||(def&&!expandedRoots.has(k));if(collapsed){collapsedRoots.delete(k);expandedRoots.add(k)}else{expandedRoots.delete(k);collapsedRoots.add(k)}saveState();lastSideHtml='';renderSide();};}); document.querySelectorAll('.chip').forEach(b=>{b.onclick=e=>{e.preventDefault();}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${r.url}?cockpit=1&t=${Date.now()}`; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
-function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.pending_approval&&r.has_session)return `<div style="height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)"><div class="placeholder" style="padding:8px 10px;border-bottom:1px solid #26313d"><strong>🔔 Waiting for Kanban Complete</strong> <button class="layoutBtn" onclick="completeTask('${esc(r.task_id)}')">Complete in Kanban</button><div class="small">${esc((r.pending&&r.pending.last_agent_message)||r.result||'Provider reported completion/attention.')}</div></div><iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe></div>`; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
+function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; if(r.task_status==='todo'||!r.parents_satisfied)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; const pendingKind=(r.pending&&r.pending.kind)||''; const completionPending=(pendingKind==='role_completed_waiting_complete'||pendingKind==='task_complete'); if(r.pending_approval&&completionPending&&r.has_session)return `<div style="height:100%;display:grid;grid-template-rows:auto minmax(0,1fr)"><div class="placeholder" style="padding:8px 10px;border-bottom:1px solid #26313d"><strong>🔔 Waiting for Kanban Complete</strong> <button class="layoutBtn" onclick="completeTask('${esc(r.task_id)}')">Complete in Kanban</button><div class="small">${esc((r.pending&&r.pending.last_agent_message)||r.result||'Provider reported completion.')}</div></div><iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe></div>`; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
 function paneHtml(i){const r=rolesById()[panes[i]]; return `<div class="pane ${i===active?'active':''}"><div class="ph" data-pane="${i}"><span class="pane-id">#${i+1}</span>${r?`${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}`:`empty`}</div><div class="body">${paneBody(r)}</div></div>`}
 function setActive(i){active=i;document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}
@@ -2936,7 +2996,22 @@ class H(BaseHTTPRequestHandler):
             if not board:
                 body = json.dumps({{"ok": False, "error": "task not found"}}, ensure_ascii=False).encode()
             else:
-                body = json.dumps(core.codex_web(board, task_id, reuse=False), ensure_ascii=False, indent=2).encode()
+                provider = None
+                try:
+                    conn = core.kb.connect(board=board)
+                    try:
+                        row = conn.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
+                        if row:
+                            provider = core._parse_role_body(row['body']).get('provider')
+                    finally:
+                        conn.close()
+                except Exception:
+                    provider = None
+                if provider == 'claude':
+                    data = core.run(board=board, task_id=task_id)
+                else:
+                    data = core.codex_web(board, task_id, reuse=False)
+                body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/sessions':
             body = json.dumps(core.sessions_all(), ensure_ascii=False, indent=2).encode()
