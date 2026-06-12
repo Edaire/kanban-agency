@@ -19,7 +19,8 @@ def test_complete_action_is_on_pane_header_not_left_chip():
     assert "function paneAction(r)" in html
     assert "function paneHeader(i,r)" in html
     assert "✓ Complete" in html
-    assert "class=\"pane-action\"" in html
+    assert "class=\"pane-action complete\"" in html
+    assert "class=\"pane-action reopen\"" in html
     assert "completeTask('${esc(r.task_id)}')" in html
     assert "function roleLabel(r){return `${esc(r.role||'session')}${paneRef(r.task_id)}`}" in html
     assert "data-complete-task" not in html

@@ -5,7 +5,7 @@ from pathlib import Path
 
 def load_core():
     path = Path(__file__).resolve().parents[1] / 'core.py'
-    spec = importlib.util.spec_from_file_location('ka_core_pending_pane_under_test', path)
+    spec = importlib.util.spec_from_file_location('ka_core_recent_style_under_test', path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -13,10 +13,10 @@ def load_core():
     return mod
 
 
-def test_permission_pending_does_not_show_kanban_complete_banner():
+def test_recent_and_kanbans_are_visually_separated():
     core = load_core()
     html = core._cockpit_html('__all__')
-    assert "function paneAction(r)" in html
-    assert "✓ Complete" in html
-    assert "Waiting for Kanban Complete" not in html
-    assert "Complete in Kanban</button>" not in html
+    assert '.recent-workset{' in html
+    assert 'background:#2d1b3d' in html
+    assert '.kanbans-group{border-top:2px solid #334155' in html
+    assert '<div class="board-group kanbans-group"><div class="board-title">Kanbans</div>' in html

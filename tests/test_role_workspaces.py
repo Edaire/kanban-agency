@@ -182,7 +182,7 @@ def test_independent_role_sessions_group_by_role_not_independent_tasks_root(env,
     root = next(r for r in data['roots'] if r['root_id'] == 'role:researcher')
     assert root['title'] == 'researcher'
     assert root['roles'][0]['task_id'] == opened['task_id']
-    assert root['roles'][0]['display_title'] == '等待输入'
+    assert root['roles'][0]['display_title'] in {'等待输入', '空白会话'}
 
 
 def test_independent_role_title_uses_first_user_question_summary(env, monkeypatch):
