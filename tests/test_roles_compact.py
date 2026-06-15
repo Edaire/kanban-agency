@@ -16,8 +16,8 @@ def load_core():
 def test_role_cards_are_compact_for_single_panel():
     core = load_core()
     html = core._cockpit_html('__all__')
-    assert '.role-card{margin:.3rem 0;padding:.4rem .5rem' in html
+    assert '.role-card{margin:.38em 0 .62em;padding:.38em .54em' in html
     assert 'inline-size:1.35em;block-size:1.35em' in html
     assert '-webkit-line-clamp:1' in html
-    assert 'font-size:.78em' in html
+    assert 'font-size:.92em' in html
     assert 'click · drag' in html

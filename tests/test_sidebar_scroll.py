@@ -19,3 +19,5 @@ def test_sidebar_scrolls_only_sessions_area():
     assert '.side{border-right:1px solid #26313d;background:#111822;overflow:hidden' in html
     assert 'grid-template-rows:auto minmax(0,1fr) auto' in html
     assert '#sessions{min-height:0;overflow:auto' in html
+    assert 'scrollbar-width:none' in html
+    assert '#sessions::-webkit-scrollbar{width:0;height:0;display:none}' in html

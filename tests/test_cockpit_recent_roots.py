@@ -32,9 +32,9 @@ def test_recent_renders_changed_roots_like_kanbans_tree():
     start = html.index('function renderRecentWorkset()')
     end = html.index('function renderSessionSide()', start)
     block = html[start:end]
-    assert 'Recent <span class="small">latest 5 roots</span>' in block
-    assert 'sessions.roots||[]' in block
-    assert '.slice(0,5)' in block
+    assert 'Recent <span class="small">${label}</span>' in block
+    assert 'unfinished=sorted.filter(rootUnfinished)' in block
+    assert 'done.slice(0,Math.max(0,5-unfinished.length))' in block
     assert 'changed_at||0' in block
     assert 'cutoff' not in block
     assert 'shortRoot(root)' in block
