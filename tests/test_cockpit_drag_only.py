@@ -16,7 +16,7 @@ def load_core():
 def test_cockpit_sidebar_chips_are_drag_only_not_click_to_open_pane():
     core = load_core()
     html = core._cockpit_html('__all__')
-    assert "b.onclick=e=>{e.preventDefault();}" in html
+    assert "b.onclick=e=>{e.preventDefault();if(b.classList.contains('role-card')&&b.dataset.role)showRoleDetails(b.dataset.role);}" in html
     assert "setPane(active,b.dataset.task)" not in html
     assert "openRole(b.dataset.role,b.dataset.board)" not in html
     assert "e.dataTransfer.setData('text/plain', b.dataset.task)" in html

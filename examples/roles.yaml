@@ -2,34 +2,60 @@
 # Copy to ~/.hermes/kanban-agency/roles.yaml and adjust rule paths.
 roles:
   default:
+    title: Default
+    description: Fallback role for general tasks.
     provider: hermes
     aliases: [default, general]
 
+  orchestrator:
+    title: Orchestrator
+    description: Break down goals, coordinate roles, and advance multi-step work.
+    provider: hermes
+    aliases: [orchestrator]
+
   assistant:
+    title: Assistant
+    description: General assistant for ad-hoc questions and lightweight collaboration.
     provider: codex
     rules: [examples/rules/assistant.md]
     aliases: [assistant, general assistant]
 
   analyst:
+    title: Analyst
+    description: Clarify requirements, scope work, and define acceptance criteria.
     provider: codex
     rules: [examples/rules/analyst.md]
     aliases: [analyst]
 
   architect:
+    title: Architect
+    description: Design technical approach, split tasks, and identify risks.
     provider: codex
     rules: [examples/rules/architect.md]
     aliases: [architect]
 
   developer:
+    title: Developer
+    description: Implement features, fix bugs, and run pre-submit checks.
     provider: codex
     rules: [examples/rules/developer.md]
     aliases: [developer]
 
   tester:
+    title: Tester
+    description: Verify implementation, review changes, run smoke/regression tests.
     provider: codex
     rules: [examples/rules/tester.md]
     aliases: [tester]
 
+  researcher:
+    title: Researcher
+    description: Research background information, compare options, and summarize findings.
+    provider: codex
+    aliases: [researcher, research]
+
   ops:
+    title: Ops
+    description: Troubleshoot services, inspect logs, and perform operational checks.
     provider: claude
     aliases: [ops, devops]
