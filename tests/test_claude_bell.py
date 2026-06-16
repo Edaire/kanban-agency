@@ -56,3 +56,46 @@ def test_claude_attention_prompt_wins_over_stale_busy_marker(monkeypatch):
     out = core._claude_attention_status('t1')
     assert out['pending'] is True
     assert out['kind'] == 'waiting_for_input'
+
+
+def test_hermes_attention_detects_ready_prompt(monkeypatch):
+    core = load_core()
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux': 'kanban-hermes-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+    screen = '''done
+────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────
+  ? for shortcuts
+'''
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, text=True, stderr=None: screen)
+    out = core._hermes_attention_status('t1')
+    assert out['pending'] is True
+    assert out['kind'] == 'waiting_for_input'
+
+
+def test_hermes_attention_running_when_no_prompt(monkeypatch):
+    core = load_core()
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux': 'kanban-hermes-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, text=True, stderr=None: '● Working...\nreading files\n')
+    out = core._hermes_attention_status('t1')
+    assert out['pending'] is False
+
+
+def test_hermes_attention_does_not_bell_for_interrupt_prompt_while_busy(monkeypatch):
+    core = load_core()
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux': 'kanban-hermes-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+    screen = '''📦 Preflight compression: ~258,195 tokens >= 256,000 threshold. This may take a moment.
+🗜️ Compacting context — summarizing earlier conversation so I can continue...
+
+ ⚕ gpt-5.5 · 50% · 🗜️ 12 · 6.0d
+─────────────────────────────────────────────────────────────────────
+⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel
+─────────────────────────────────────────────────────────────────────
+'''
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, text=True, stderr=None: screen)
+    out = core._hermes_attention_status('t1')
+    assert out['pending'] is False
+    assert out['kind'] == 'busy_interruptible'

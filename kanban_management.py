@@ -124,9 +124,27 @@ def create_kanban_task_api(
                 workspace_path=workdir,
                 initial_status="running",
             )
-            adv = advance(board, root_id=task_id, dry_run=False)
-            return {"ok": True, "mode": "workflow", "task_id": task_id, "workdir": workdir, "warnings": warnings, "advance": adv}
+        else:
+            task_id = None
+    except Exception as exc:
+        conn.close()
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if mode == "workflow":
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if mode == "workflow":
+        # Important: close the root-task connection before advance(). advance()
+        # opens its own connection and starts provider/session writes. Keeping
+        # the first connection open while nested workflow creation starts has
+        # triggered sqlite b-tree/index corruption on macOS with mixed readers.
+        adv = advance(board, root_id=task_id, dry_run=False)
+        return {"ok": True, "mode": "workflow", "task_id": task_id, "workdir": workdir, "warnings": warnings, "advance": adv}
 
+    conn = kb.connect(board=board)
+    try:
         role = str(payload.get("role") or "").strip().lower()
         if not role:
             return {"ok": False, "error": "role is required for independent task"}

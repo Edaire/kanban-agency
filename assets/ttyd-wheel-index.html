@@ -4,7 +4,7 @@
 <script id="kanban-wheel-scroll-only">
 (function(){
   function taskId(){
-    var m=(document.title||'').match(/t_[A-Za-z0-9]+/);
+    var m=(document.title||'').match(/t_[A-Za-z0-9_]+/);
     return m?m[0]:null;
   }
   function install(){

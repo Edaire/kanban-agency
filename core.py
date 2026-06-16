@@ -2278,6 +2278,48 @@ def _claude_attention_status(task_id: str) -> dict[str, Any]:
         return {"pending": True, "kind": "waiting_for_input", "tmux_name": tmux_name, "tail": tail}
     return {"pending": False, "kind": "running_or_idle_no_prompt", "tmux_name": tmux_name, "tail": tail}
 
+
+def _hermes_attention_status(task_id: str) -> dict[str, Any]:
+    """Detect Hermes native TUI waiting-for-input/permission prompts from tmux.
+
+    Hermes-backed role sessions run inside tmux and do not emit Codex JSONL
+    approval events. Treat the idle composer prompt as attention so Cockpit can
+    ring the bell when a Hermes/orchestrator session is waiting on the user.
+    """
+    web = _read_json_file(_hermes_web_state_path(task_id))
+    tmux_name = web.get("tmux_name") or web.get("tmux")
+    if not tmux_name:
+        return {"pending": False, "reason": "no_tmux"}
+    tmux_name = str(tmux_name)
+    if not _tmux_has_session(tmux_name):
+        return {"pending": False, "reason": "tmux_not_alive", "tmux_name": tmux_name}
+    try:
+        text = subprocess.check_output(["tmux", "capture-pane", "-t", tmux_name, "-p", "-S", "-80"], text=True, stderr=subprocess.STDOUT)
+    except Exception as exc:
+        return {"pending": False, "reason": f"capture_failed: {exc}", "tmux_name": tmux_name}
+    tail = "\n".join(text.splitlines()[-12:])
+    lower = tail.lower()
+    permission_markers = [
+        "do you want to proceed", "allow", "permission", "yes, i accept",
+        "confirm", "approval", "approve", "是否继续", "确认"
+    ]
+    prompt_markers = ["❯", "? for shortcuts"]
+    # Hermes shows an input-looking line with "msg=interrupt" while the agent is
+    # busy and only accepting steering/cancel commands. That is not a user-input
+    # bell; otherwise the bell turns on when work starts and never clears until
+    # the next full-screen redraw.
+    busy_markers = [
+        "msg=interrupt", "compacting context", "preflight compression",
+        "running", "reading", "writing", "thinking", "working",
+    ]
+    if any(m in lower for m in permission_markers):
+        return {"pending": True, "kind": "permission_prompt", "tmux_name": tmux_name, "tail": tail}
+    if any(m in lower for m in busy_markers):
+        return {"pending": False, "kind": "busy_interruptible", "tmux_name": tmux_name, "tail": tail}
+    if any(m in tail for m in prompt_markers):
+        return {"pending": True, "kind": "waiting_for_input", "tmux_name": tmux_name, "tail": tail}
+    return {"pending": False, "kind": "running_or_idle_no_prompt", "tmux_name": tmux_name, "tail": tail}
+
 def _claude_session_live(task_id: str) -> dict[str, Any]:
     web = _read_json_file(_claude_web_state_path(task_id))
     pid = web.get("pid")
@@ -2324,7 +2366,7 @@ def session_alert_status(board: str | None, task_id: str) -> dict[str, Any]:
         web = _read_json_file(_hermes_web_state_path(task_id))
         thread_id = None
         live = _hermes_session_live(task_id)
-        pending = {"pending": False, "reason": "hermes_no_native_bell_detection"}
+        pending = _hermes_attention_status(task_id)
     else:
         web = _read_json_file(_codex_web_state_path(task_id))
         thread_id = web.get('thread_id') or bridge.get('thread_id')
@@ -2531,12 +2573,14 @@ def _summary_title_from_result(result: str | None) -> str | None:
 
 
 def _independent_role_display_title(task_id: str, role: str, task_title: str | None = None, result: str | None = None) -> str:
+    # Keep independent-chat titles stable. Agent result / latest pending output is
+    # deliberately NOT used here because it makes the left-side root title flicker
+    # as the conversation evolves. If the task has a manual/non-placeholder title,
+    # trust the Kanban DB title. Otherwise infer once from the first real user
+    # message in the provider transcript; users can later rename it explicitly.
     cleaned = _clean_independent_title(task_title, role)
     if cleaned != "空白会话":
         return cleaned
-    summarized = _summary_title_from_result(result)
-    if summarized:
-        return summarized
     state = _read_json_file(_codex_web_state_path(task_id))
     thread_id = state.get("thread_id")
     if not thread_id:
@@ -2545,10 +2589,6 @@ def _independent_role_display_title(task_id: str, role: str, task_title: str | N
             if ws.get("task_id") == task_id:
                 thread_id = ws.get("thread_id")
                 break
-    pending = _codex_live_pending_approval(thread_id) if thread_id else {}
-    summarized = _summary_title_from_result(pending.get("last_agent_message"))
-    if summarized:
-        return summarized
     text = _first_user_question_for_thread(thread_id)
     if text and not text.strip().startswith("你是一个"):
         return _summarize_user_question(text)
@@ -2859,6 +2899,42 @@ def create_task_api(board: str, payload: dict[str, Any]) -> dict[str, Any]:
         agency_assignee=_agency_assignee,
     )
 
+
+
+def update_task_title_api(task_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    task_id = (task_id or "").strip()
+    payload = payload or {}
+    title = str(payload.get("title") or "").strip()
+    if not task_id:
+        return {"ok": False, "error": "task_id is required"}
+    if not title:
+        return {"ok": False, "error": "title is required"}
+    if len(title) > 160:
+        return {"ok": False, "error": "title is too long (max 160 chars)"}
+    board = str(payload.get("board") or "").strip() or _find_board_for_task(task_id)
+    if not board or not kb.board_exists(board):
+        return {"ok": False, "error": f"task not found: {task_id}"}
+    conn = kb.connect(board=board)
+    try:
+        row = conn.execute("SELECT id,title,body FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            return {"ok": False, "error": f"task not found: {task_id}"}
+        old_title = row["title"] or ""
+        meta = _parse_role_body(row["body"] or "")
+        role = meta.get("role") or "session"
+        # Independent role titles keep the standard Kanban role prefix while the
+        # display title stays user-editable and synchronized to the DB.
+        new_title = f"[agency] {role}: {title}" if old_title.startswith("[agency]") else title
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET title=? WHERE id=?", (new_title, task_id))
+            try:
+                kb._append_event(conn, task_id, "renamed", {"source": "cockpit", "from": old_title, "to": new_title})
+            except Exception:
+                pass
+            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (task_id, "cockpit", f"Renamed from {old_title!r} to {new_title!r} via Cockpit."))
+    finally:
+        conn.close()
+    return {"ok": True, "board": board, "task_id": task_id, "title": new_title, "display_title": title}
 
 
 def reopen_task_api(task_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3198,6 +3274,9 @@ function syncTaskRoleVisibility(){const wrap=document.getElementById('taskRoleWr
 function boardOptionsHtml(selected){return (sessions.boards||[]).map(b=>`<option value="${esc(b.board)}" ${b.board===selected?'selected':''}>${esc(b.title||b.board)}</option>`).join('')}
 function showTaskDialog(b){const el=document.getElementById('taskDialog');const sel=document.getElementById('newTaskBoard');if(sel)sel.innerHTML=boardOptionsHtml(b||'');if(el)el.style.display='flex';syncTaskRoleVisibility();setTimeout(()=>document.getElementById('newTaskTitle')?.focus(),0)}
 function hideTaskDialog(){const el=document.getElementById('taskDialog');if(el)el.style.display='none'}
+function slugifyBoardName(name){return String(name||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)}
+function showBoardDialog(){showModal(`<div class="role-modal"><h2>New Kanban</h2><div class="role-form"><label>Slug <span class="small">stable id, e.g. bhumi_claw</span></label><input id="boardNewSlug" placeholder="kanban_slug"><label>Name</label><input id="boardNewName" placeholder="Display name"><label>Workdir <span class="small">absolute project path</span></label><input id="boardNewWorkdir" placeholder="/Users/admin/code/project"><label>Description</label><textarea id="boardNewDesc" placeholder="optional"></textarea><div id="boardNewMsg" class="role-form-msg"></div></div><div class="modal-actions"><button class="layoutBtn" onclick="closeModal()">Cancel</button><button class="layoutBtn active" onclick="createBoard()">Create</button></div></div>`);setTimeout(()=>{const name=document.getElementById('boardNewName');const slug=document.getElementById('boardNewSlug');if(name&&slug){name.oninput=()=>{if(!slug.dataset.touched)slug.value=slugifyBoardName(name.value)};slug.oninput=()=>{slug.dataset.touched='1'}};document.getElementById('boardNewName')?.focus()},0)}
+async function createBoard(){const msg=document.getElementById('boardNewMsg');const payload={slug:document.getElementById('boardNewSlug')?.value.trim(),name:document.getElementById('boardNewName')?.value.trim(),workdir:document.getElementById('boardNewWorkdir')?.value.trim(),description:document.getElementById('boardNewDesc')?.value.trim()};if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}closeModal();sideMode='sessions';lastSideHtml='';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
 function showModal(html){const el=document.getElementById('genericModal');const body=document.getElementById('genericModalBody');if(body)body.innerHTML=html;if(el)el.style.display='flex'}
 function closeModal(){const el=document.getElementById('genericModal');if(el)el.style.display='none'}
 async function createTask(){const msg=document.getElementById('taskMsg');const payload={board:document.getElementById('newTaskBoard')?.value,title:document.getElementById('newTaskTitle')?.value.trim(),mode:document.getElementById('newTaskMode')?.value,role:document.getElementById('newTaskRole')?.value,body:document.getElementById('newTaskBody')?.value.trim()};if(msg)msg.textContent='Creating...';try{const r=await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}hideTaskDialog();document.getElementById('newTaskTitle').value='';document.getElementById('newTaskBody').value='';sideMode='sessions';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
@@ -3233,6 +3312,7 @@ async function resumeTask(task){const i=panes.findIndex(x=>x===task);const paneI
 async function openRole(role,b){try{const r=await fetch('/roles/'+encodeURIComponent(b||'')+'/'+encodeURIComponent(role)+'/open',{cache:'no-store'});const data=await r.json();if(data&&data.ok&&data.task_id){setPane(active,data.task_id);await refresh();}else{console.error('openRole failed',data)}}catch(e){console.error(e)}}
 async function completeTask(task){if(!task)return;if(!confirm('Complete '+task+' in Kanban?'))return;try{const r=await fetch('/complete/'+encodeURIComponent(task),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});const data=await r.json();if(!data.ok){alert(data.error||'Complete failed');console.error('complete failed',data);return;}await refresh();const i=panes.findIndex(x=>x===task);if(i>=0)replacePaneDom(i);}catch(e){alert(String(e));console.error(e)}}
 async function reopenTask(task){if(!task)return;if(!confirm('Reopen '+task+' as running?'))return;try{const r=await fetch('/reopen/'+encodeURIComponent(task),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'running'})});const data=await r.json();if(!data.ok){alert(data.error||'Reopen failed');console.error('reopen failed',data);return;}await refresh();const i=panes.findIndex(x=>x===task);if(i>=0)replacePaneDom(i);}catch(e){alert(String(e));console.error(e)}}
+async function renameTask(task,current){if(!task)return;const title=prompt('Rename independent chat',current||'');if(title===null)return;const clean=title.trim();if(!clean)return;try{const r=await fetch('/tasks/'+encodeURIComponent(task)+'/title',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});const data=await r.json();if(!data.ok){alert(data.error||'Rename failed');console.error('rename failed',data);return;}lastSideHtml='';await refresh();const i=panes.findIndex(x=>x===task);if(i>=0)replacePaneDom(i);}catch(e){alert(String(e));console.error(e)}}
 function clearDragging(){document.body.classList.remove('dragging')}
 window.addEventListener('mouseup',clearDragging,true);window.addEventListener('pointerup',clearDragging,true);window.addEventListener('blur',clearDragging,true);document.addEventListener('visibilitychange',clearDragging,true);
 function setSideMode(mode){sideMode=mode==='roles'?'roles':'sessions';saveState();lastSideHtml='';renderSide()}
@@ -3246,12 +3326,12 @@ function touchRecent(task){if(!task)return;recentTasks=recentTasks||{};recentTas
 function seedRecentFromPanes(){recentTasks=recentTasks||{};let changed=false;const now=Math.floor(Date.now()/1000);for(const task of panes){if(task&&!recentTasks[task]){recentTasks[task]=now;changed=true}}pruneRecent();if(changed)saveState()}
 function rootUnfinished(root){const roles=(root.roles||[]).filter(r=>r.task_id);if(!roles.length)return !!(root.status&&root.status!=='done'&&root.status!=='empty'&&root.status!=='archived');return roles.some(r=>!['done','archived'].includes(r.task_status||''))}
 function renderRecentWorkset(){const sorted=[...(sessions.roots||[])].sort((a,b)=>Number(b.changed_at||0)-Number(a.changed_at||0));const unfinished=sorted.filter(rootUnfinished);const done=sorted.filter(r=>!rootUnfinished(r));const recent=[...unfinished,...done.slice(0,Math.max(0,5-unfinished.length))];if(!recent.length)return '';const label=unfinished.length>5?'unfinished roots':(unfinished.length?`unfinished + latest ${Math.max(0,5-unfinished.length)}`:'latest 5 roots');let html=`<div class="board-group recent-workset"><div class="board-title">Recent <span class="small">${label}</span></div>`;for(const root of recent){const key='recent/'+rootKey(root);const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`;if(!collapsed){for(const r of (root.roles||[])){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}}html+='</div>'}html+='</div>';return html}
-function renderSessionSide(){let html=renderRecentWorkset()+'<div class="board-group kanbans-group"><div class="board-title">Kanbans</div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
+function renderSessionSide(){let html=renderRecentWorkset()+'<div class="board-group kanbans-group"><div class="board-title">Kanbans <span style="float:right;cursor:pointer" title="Create Kanban" onclick="event.stopPropagation();showBoardDialog()">+</span></div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
 function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('[data-board-drag]').forEach(el=>{el.onclick=e=>{if(e.target&&e.target.tagName==='SPAN')return;const b=el.dataset.kanban||el.dataset.boardDrag;if(collapsedKanbans.has(b))collapsedKanbans.delete(b);else collapsedKanbans.add(b);saveState();lastSideHtml='';renderSide()};el.ondragstart=e=>{e.dataTransfer.setData('application/x-kanban-agency-board',el.dataset.boardDrag);document.body.classList.add('dragging')};el.ondragend=clearDragging}); document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root;const def=el.dataset.defaultCollapsed==='1';const collapsed=collapsedRoots.has(k)||(def&&!expandedRoots.has(k));if(collapsed){collapsedRoots.delete(k);expandedRoots.add(k)}else{expandedRoots.delete(k);collapsedRoots.add(k)}saveState();lastSideHtml='';renderSide();};}); document.querySelectorAll('.chip,.role-card').forEach(b=>{b.onclick=e=>{e.preventDefault();if(b.classList.contains('role-card')&&b.dataset.role)showRoleDetails(b.dataset.role);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${r.url}?cockpit=1&t=${Date.now()}`; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
 function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; const hasLiveSession=!!(r.has_session&&r.live&&r.tmux_alive); if((r.task_status==='todo'||r.task_status==='ready')&&!r.parents_satisfied&&!hasLiveSession)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
 function rolesById(){return Object.fromEntries(allRoles().filter(r=>r.task_id).map(r=>[r.task_id,r]))}
-function paneAction(r){if(!r||!r.task_id||r.task_status==='archived')return '';if(r.task_status==='done')return `<button class="pane-action reopen" title="Reopen as running" onclick="event.stopPropagation();reopenTask('${esc(r.task_id)}')">↻ Running</button>`;return `<button class="pane-action complete" title="Complete in Kanban" onclick="event.stopPropagation();completeTask('${esc(r.task_id)}')">✓ Complete</button>`}
+function paneAction(r){if(!r||!r.task_id||r.task_status==='archived')return '';const rename=r.independent?`<button class="pane-action" title="Rename independent chat" onclick="event.stopPropagation();renameTask('${esc(r.task_id)}','${esc(r.display_title||r.title||'')}')">✎ Title</button>`:'';if(r.task_status==='done')return rename+`<button class="pane-action reopen" title="Reopen as running" onclick="event.stopPropagation();reopenTask('${esc(r.task_id)}')">↻ Running</button>`;return rename+`<button class="pane-action complete" title="Complete in Kanban" onclick="event.stopPropagation();completeTask('${esc(r.task_id)}')">✓ Complete</button>`}
 function paneHeader(i,r){return `<span class="pane-id">#${i+1}</span>${r?`${sym(r.task_status,r.pending_approval)} ${esc(r.role)} - ${esc(displayStatus(r))} - ${esc(r.task_id)}${paneAction(r)}`:`empty`}`}
 function paneHtml(i){const r=rolesById()[panes[i]]; return `<div class="pane ${i===active?'active':''}"><div class="ph" data-pane="${i}">${paneHeader(i,r)}</div><div class="body">${paneBody(r)}</div></div>`}
 function setActive(i){active=i;if(panes[i])touchRecent(panes[i]);document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}
@@ -3274,7 +3354,7 @@ def codex_web_gateway_start(port: int = CODEX_WEB_GATEWAY_PORT) -> dict[str, Any
     script = CODEX_WEB_DIR / "gateway.py"
     plugin_core = Path(__file__).resolve()
     gateway_code = """
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 import html
 import importlib.util, json, sys
@@ -3332,6 +3412,16 @@ class H(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
             data = core.archive_board_api(payload)
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path.startswith('/tasks/') and path.endswith('/title'):
+            task_id = path.strip('/').split('/')[1].strip()
+            try:
+                length = int(self.headers.get('content-length') or '0')
+                raw = self.rfile.read(length).decode('utf-8') if length else '{{}}'
+                payload = json.loads(raw or '{{}}')
+            except Exception as exc:
+                self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
+            data = core.update_task_title_api(task_id, payload)
             self._send_json(data, status=200 if data.get('ok') else 400); return
         if path.startswith('/reopen/'):
             task_id = path.strip('/').split('/', 1)[1].strip()
@@ -3517,7 +3607,7 @@ setInterval(poll,3000);setTimeout(loadFrame,2500);poll();
             body = page.encode()
             self.send_response(200); self.send_header('content-type','text/html; charset=utf-8'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         self.send_response(404); self.end_headers()
-ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
+HTTPServer(('127.0.0.1', PORT), H).serve_forever()
 """.format(core=str(plugin_core), port=int(port))
     script.write_text(gateway_code, encoding='utf-8')
     stdout_path = CODEX_WEB_DIR / 'gateway.stdout.log'
