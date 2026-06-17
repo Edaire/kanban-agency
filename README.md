@@ -8,6 +8,8 @@ Kanban Agency turns [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
 > Hermes Agent is the source of truth for tasks, dependencies, comments, and human acceptance. Kanban Agency adds role orchestration, tmux/ttyd session persistence, browser Cockpit control, and lifecycle hygiene around existing agent CLIs.
 
+![Kanban Agency connects Hermes tasks, roles, agent sessions, and recovery state](docs/assets/01-kanban-agency-overview.png)
+
 ## Why Kanban Agency
 
 Most AI coding work does not fail because there are too few agents. It fails because the work becomes impossible to supervise:
@@ -42,6 +44,8 @@ Kanban Agency is intentionally built around Hermes instead of inventing another 
 
 This makes the board the durable index for agent work: if a browser tab, terminal, or provider process disappears, the task still knows which role it represents, which provider thread it used, and how to resume it.
 
+![Architecture: Hermes Kanban outside, native agents inside tmux/ttyd sessions](docs/assets/05-kanban-agency-architecture.png)
+
 ## Highlights
 
 - **Hermes-native Kanban workflow** — tasks, comments, dependencies, and audit history stay in Hermes Kanban.
@@ -54,6 +58,8 @@ This makes the board the durable index for agent work: if a browser tab, termina
 - **Recent activity index** — sort roots by real task/provider activity, not just creation time.
 - **Session lifecycle hygiene** — stale completed sessions can be closed; orphan ttyd/tmux wrappers can be reported and cleaned.
 - **Private role rules** — keep team/project instructions in your Hermes profile while publishing safe templates.
+
+![Roles, providers, and private rule files are explicit workflow context](docs/assets/03-kanban-agency-role-rules-harness.png)
 
 ## What it feels like
 
@@ -89,6 +95,8 @@ You can inspect the live terminal, scroll tmux history, approve tool calls, past
 - **Complete is the safety boundary.** Provider completion does not automatically mean task acceptance.
 - **Session recovery is mandatory.** Multi-agent work only scales when every live terminal can be traced back to a task, role, provider, workdir, and thread id.
 - **Repeated corrections should become rules.** User rejection, supplementation, and steering are first-class signals for improving role prompts and workflow gates.
+
+![Session recovery: every live terminal should trace back to task, role, provider, and thread id](docs/assets/04-kanban-agency-session-index.png)
 
 ## Common use cases
 
@@ -217,6 +225,8 @@ analyst -> architect -> developer -> tester
 ```
 
 Later roles are visible up front as `todo`; they become `ready` when upstream roles are completed.
+
+![Typical workflow: root task, role cards, native sessions, attention, Complete gate](docs/assets/07-kanban-agency-workflow.png)
 
 ## Browser Cockpit
 
