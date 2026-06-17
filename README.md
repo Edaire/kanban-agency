@@ -8,6 +8,8 @@ Kanban Agency turns [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
 > Hermes Agent is the source of truth for tasks, dependencies, comments, and human acceptance. Kanban Agency adds role orchestration, tmux/ttyd session persistence, browser Cockpit control, and lifecycle hygiene around existing agent CLIs.
 
+![Kanban Agency Cockpit showing multiple live role sessions in one browser workspace](docs/assets/06-kanban-agency-cockpit.jpg)
+
 ![Kanban Agency connects Hermes tasks, roles, agent sessions, and recovery state](docs/assets/01-kanban-agency-overview.png)
 
 ## Why Kanban Agency

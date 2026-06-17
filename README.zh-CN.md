@@ -8,6 +8,8 @@ Kanban Agency 把 [Hermes Agent](https://github.com/NousResearch/hermes-agent) K
 
 > Hermes Agent 负责事实来源：任务、依赖、评论和人工验收。Kanban Agency 在此之上增加 role 编排、tmux/ttyd 会话持久化、浏览器 Cockpit 控制面，以及 session 生命周期治理。
 
+![Kanban Agency Cockpit：在一个浏览器工作台里查看和接管多个 live role session](docs/assets/06-kanban-agency-cockpit.jpg)
+
 ![Kanban Agency 把 Hermes 任务、角色、Agent 会话和恢复状态连接起来](docs/assets/01-kanban-agency-overview.png)
 
 ## 为什么需要 Kanban Agency
