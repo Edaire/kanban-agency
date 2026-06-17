@@ -2,62 +2,101 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-**Kanban-native multi-agent orchestration for Hermes Agent, OpenAI Codex CLI, and Anthropic Claude Code.**
+**A Hermes-native cockpit for trustworthy multi-agent software work.**
 
-Kanban Agency turns a Hermes Kanban board into a live AI-agent cockpit: split a feature into roles, run each role in its own native Codex or Claude Code terminal, and keep the whole workflow auditable through Kanban tasks.
+Kanban Agency turns [Hermes Agent](https://github.com/NousResearch/hermes-agent) Kanban tasks into auditable multi-agent workflows. It lets you split real work into roles such as analyst, architect, developer, tester, researcher, and ops; run each role in its own native Codex CLI, Claude Code, or Hermes session; and recover the whole execution surface from the Kanban board.
 
-> Hermes Agent provides the Kanban/task layer. Codex and Claude Code provide native agent sessions. Kanban Agency wires them together with tmux, ttyd, and a browser cockpit.
+> Hermes Agent is the source of truth for tasks, dependencies, comments, and human acceptance. Kanban Agency adds role orchestration, tmux/ttyd session persistence, browser Cockpit control, and lifecycle hygiene around existing agent CLIs.
 
-## Why this exists
+## Why Kanban Agency
 
-Most AI coding workflows are either:
+Most AI coding work does not fail because there are too few agents. It fails because the work becomes impossible to supervise:
 
-- one giant chat thread that is hard to audit,
-- a pile of terminal sessions with no workflow state, or
-- a custom UI that hides the native Codex / Claude Code experience.
+- one giant chat thread hides decisions and evidence,
+- terminal sessions drift away from task state,
+- role boundaries blur between planning, implementation, testing, and ops,
+- agent completion is confused with human acceptance,
+- old TUI sessions leak until the machine slows down,
+- useful corrections stay trapped in chat history instead of becoming workflow rules.
 
-Kanban Agency keeps the native tools intact while adding workflow structure:
+Kanban Agency is the small engineering layer between "manual agent juggling" and "blind full automation". It keeps humans in the loop where judgment is still needed, while making every intervention observable, recoverable, and eventually automatable.
 
 ```text
-Hermes Kanban task
-  -> role card: analyst / architect / developer / tester / ops
-  -> native Codex CLI or Claude Code session in tmux
-  -> browser Cockpit pane through ttyd
-  -> Kanban status, comments, dependencies, and human Complete gate
+Hermes Kanban root task
+  -> role cards: analyst -> architect -> developer -> tester
+  -> native agent sessions: Codex CLI / Claude Code / Hermes
+  -> tmux persistence + ttyd browser panes
+  -> comments, events, dependencies, Complete gates, session health
 ```
+
+## Why Hermes matters
+
+Kanban Agency is intentionally built around Hermes instead of inventing another workflow database:
+
+| Hermes layer | Kanban Agency adds |
+| --- | --- |
+| Kanban boards, tasks, dependencies, comments | Role-aware multi-agent workflow structure |
+| Durable task state and audit history | Native TUI session binding and recovery |
+| Human-in-the-loop Complete gate | Browser Cockpit for observing and taking over live sessions |
+| Hermes sessions, memory, skills, tools | A place to turn repeated human corrections into reusable role rules |
+
+This makes the board the durable index for agent work: if a browser tab, terminal, or provider process disappears, the task still knows which role it represents, which provider thread it used, and how to resume it.
 
 ## Highlights
 
 - **Hermes-native Kanban workflow** — tasks, comments, dependencies, and audit history stay in Hermes Kanban.
 - **Role-based multi-agent flow** — precreate analyst -> architect -> developer -> tester lanes for feature work.
-- **OpenAI Codex CLI support** — run Codex as a persistent native TUI session, not a fake wrapper.
-- **Anthropic Claude Code support** — run Claude Code for ops / review / interactive workflows.
+- **Native provider sessions** — run OpenAI Codex CLI, Anthropic Claude Code, or Hermes as real terminal/TUI sessions.
 - **Browser Cockpit** — drag live role sessions into fixed panes and work without switching terminals.
-- **tmux-backed persistence** — browser refreshes do not kill the agent session.
-- **Editable by default** — Cockpit panes are writable native terminals, not read-only screenshots.
-- **Bell / attention signals** — Codex approval state and Claude waiting/permission prompts surface in status.
-- **tmux copy-mode scrolling** — Mac trackpad scrolling maps to tmux history instead of broken xterm scrollback.
-- **Human acceptance gate** — agent output does not auto-complete a task; humans click Complete.
+- **tmux-backed persistence** — browser refreshes do not kill agent sessions; stopped sessions can be resumed from the task.
+- **Attention signals** — Codex approvals and Claude/Hermes waiting states surface as bells/status badges.
+- **Human acceptance gate** — an agent can finish a role, but downstream workflow waits for human Complete.
+- **Recent activity index** — sort roots by real task/provider activity, not just creation time.
+- **Session lifecycle hygiene** — stale completed sessions can be closed; orphan ttyd/tmux wrappers can be reported and cleaned.
+- **Private role rules** — keep team/project instructions in your Hermes profile while publishing safe templates.
 
-## What it looks like conceptually
+## What it feels like
 
 ```text
-/cockpit
+Cockpit
 
-CONTROL / Sessions
-  [analyst]    running   Codex
-  [architect]  ready     Codex
-  [developer]  todo      Codex
-  [tester]     todo      Codex
-  [ops]        blocked   Claude Code
+Recent
+  Agent file upload                           🔔
+    analyst     done       Codex
+    architect   done       Codex
+    developer   running    Codex
+    tester      ready      Codex
 
 Panes
-  #1 analyst Codex TUI
-  #2 ops Claude Code TUI
-  #3 developer Codex TUI
+  #1 developer Codex TUI
+  #2 tester Codex TUI
+  #3 ops Claude Code TUI
 ```
 
-Each pane is a real `ttyd -> tmux -> codex/claude` terminal.
+Each pane is a real:
+
+```text
+browser -> ttyd -> tmux -> codex / claude / hermes
+```
+
+You can inspect the live terminal, scroll tmux history, approve tool calls, paste fixes, mark the role Complete, and later reopen the same task if you need the evidence again.
+
+## Design principles
+
+- **Kanban remains the source of truth.** Role sessions are execution surfaces; task state lives in Hermes.
+- **Native tools stay native.** Kanban Agency does not reimplement Codex, Claude Code, Hermes, tools, skills, or model runtime.
+- **Human intervention is a feature, not a failure.** Early workflows should be observable and correctable before becoming automatic.
+- **Complete is the safety boundary.** Provider completion does not automatically mean task acceptance.
+- **Session recovery is mandatory.** Multi-agent work only scales when every live terminal can be traced back to a task, role, provider, workdir, and thread id.
+- **Repeated corrections should become rules.** User rejection, supplementation, and steering are first-class signals for improving role prompts and workflow gates.
+
+## Common use cases
+
+- Feature delivery with separate analyst / architect / developer / tester roles.
+- Long-running Codex or Claude sessions that must survive browser refreshes.
+- Human-reviewed automation where agents draft, implement, and test, but humans decide when to advance.
+- Research or ops workflows that need multiple independent agent terminals but still need task-level audit history.
+- Teams experimenting with multi-agent automation without abandoning their existing Hermes, Codex, or Claude workflows.
 
 ## Requirements
 
@@ -76,11 +115,31 @@ brew install tmux ttyd
 
 ## Install as a Hermes plugin
 
-Clone or download this repository, then install it into your Hermes profile:
+Kanban Agency is a Hermes plugin. The recommended installation path is Hermes' plugin manager, which clones the repository into your profile and lets Hermes enable/disable it consistently:
+
+```bash
+hermes plugins install <owner>/kanban-agency --enable
+# or from a full Git URL:
+hermes plugins install https://github.com/<owner>/kanban-agency.git --enable
+```
+
+For local development, install from a checkout by copying or symlinking it into your Hermes profile:
 
 ```bash
 mkdir -p ~/.hermes/plugins
-cp -R . ~/.hermes/plugins/kanban-agency
+ln -s /absolute/path/to/kanban-agency ~/.hermes/plugins/kanban-agency
+# or, if you prefer a copy:
+# cp -R /absolute/path/to/kanban-agency ~/.hermes/plugins/kanban-agency
+hermes plugins enable kanban-agency
+```
+
+Check status:
+
+```bash
+hermes plugins list --plain --no-bundled
+hermes plugins enable kanban-agency
+hermes plugins disable kanban-agency
+hermes plugins update kanban-agency
 ```
 
 Create private role config and rule files:
