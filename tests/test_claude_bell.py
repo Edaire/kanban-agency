@@ -99,3 +99,21 @@ def test_hermes_attention_does_not_bell_for_interrupt_prompt_while_busy(monkeypa
     out = core._hermes_attention_status('t1')
     assert out['pending'] is False
     assert out['kind'] == 'busy_interruptible'
+
+
+def test_hermes_attention_prompt_wins_over_task_text_containing_running(monkeypatch):
+    core = load_core()
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux': 'kanban-hermes-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+    screen = '''现在刷新 8766，重新打开 orchestrator - running - t_1b0740ff
+滚动应该比刚才顺很多
+
+ ⚕ gpt-5.5 │ 150K/512K │ [███░░░░░░░] 29% │ 🗜️ 15 │ 7.0d │ ⏲ 4m 7s
+────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────
+'''
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda cmd, text=True, stderr=None: screen)
+    out = core._hermes_attention_status('t1')
+    assert out['pending'] is True
+    assert out['kind'] == 'waiting_for_input'

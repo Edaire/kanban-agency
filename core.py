@@ -780,8 +780,8 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = CODEX_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = CODEX_WEB_DIR / f"{task.id}.stderr.log"
-    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
-    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -853,8 +853,8 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = CODEX_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = CODEX_WEB_DIR / f"{task.id}.stderr.log"
-    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
-    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -921,8 +921,8 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = HERMES_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = HERMES_WEB_DIR / f"{task.id}.stderr.log"
-    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
-    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -1174,6 +1174,92 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 def _write_json_file(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _state_paths_for_task(task_id: str) -> list[Path]:
+    paths = [_codex_web_state_path(task_id), _hermes_web_state_path(task_id)]
+    try:
+        paths.append(_claude_web_state_path(task_id))
+        paths.append(_claude_state_path(task_id))
+    except Exception:
+        pass
+    # Preserve order while deduplicating; Claude web/state may coincide in future.
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
+def _terminate_pid(pid: Any, *, timeout: float = 2.0) -> bool:
+    if not pid:
+        return False
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return False
+    if not _pid_alive(pid_i):
+        return False
+    try:
+        os.killpg(pid_i, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid_i, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + timeout
+    while time.time() < deadline and _pid_alive(pid_i):
+        time.sleep(0.05)
+    if _pid_alive(pid_i):
+        try:
+            os.killpg(pid_i, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid_i, signal.SIGKILL)
+            except Exception:
+                pass
+    return not _pid_alive(pid_i)
+
+
+def _stop_provider_session_state(task_id: str, *, reason: str, now: int | None = None, kill_tmux: bool = True, dry_run: bool = False) -> dict[str, Any]:
+    now_i = int(now or time.time())
+    state_paths = [p for p in _state_paths_for_task(task_id) if p.exists()]
+    states: list[dict[str, Any]] = []
+    for path in state_paths:
+        state = _read_json_file(path)
+        if not state:
+            continue
+        states.append({"path": str(path), "state": state})
+    tmux_names = sorted({str((item["state"].get("tmux_name") or item["state"].get("tmux") or "")).strip() for item in states if (item["state"].get("tmux_name") or item["state"].get("tmux"))})
+    pids = []
+    for item in states:
+        state = item["state"]
+        for key in ("pid", "readonly_pid"):
+            if state.get(key):
+                pids.append((key, state.get(key)))
+    if dry_run:
+        return {"task_id": task_id, "dry_run": True, "state_paths": [str(p) for p in state_paths], "tmux_names": tmux_names, "pids": pids}
+    stopped_pids = []
+    for key, pid in pids:
+        stopped_pids.append({"key": key, "pid": pid, "stopped": _terminate_pid(pid)})
+    killed_tmux = []
+    if kill_tmux:
+        for tmux_name in tmux_names:
+            existed = _tmux_has_session(tmux_name)
+            ok = False
+            if existed:
+                cp = subprocess.run(["tmux", "kill-session", "-t", tmux_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_tmux_env())
+                ok = cp.returncode == 0 or not _tmux_has_session(tmux_name)
+            killed_tmux.append({"tmux_name": tmux_name, "existed": existed, "stopped": ok})
+    for item in states:
+        path = Path(item["path"])
+        state = dict(item["state"])
+        state.update({"state": "stopped", "stopped_at": now_i, "stop_reason": reason, "tmux_stopped": killed_tmux})
+        _write_json_file(path, state)
+    return {"task_id": task_id, "state_paths": [str(p) for p in state_paths], "stopped_pids": stopped_pids, "tmux": killed_tmux}
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -1554,16 +1640,70 @@ def _codex_native_session_live_for_status(task_id: str, thread_id: str | None = 
             live["live"] = False
         return live
 
+# Cockpit gateway currently runs as a single-threaded HTTPServer. These short
+# TTL process/session caches intentionally do not use locks; add locking before
+# switching the gateway back to ThreadingHTTPServer.
+_CODEX_SESSION_INDEX_CACHE: tuple[float, dict[str, Path]] = (0.0, {})
+_CODEX_SESSION_INDEX_CACHE_TTL = 2.0
+_CODEX_SESSION_FILE_CACHE: dict[str, tuple[float, Path | None]] = {}
+
+
+def _codex_session_index() -> dict[str, Path]:
+    """Return a short-lived thread_id -> latest session file index.
+
+    Cockpit calls /sessions on a timer and may need status for dozens of roles.
+    A per-thread Path.rglob over ~/.codex/sessions is O(tasks * session files)
+    and was the dominant gateway CPU cost. Scan once per TTL instead.
+    """
+    global _CODEX_SESSION_INDEX_CACHE
+    now = time.time()
+    ts, cached = _CODEX_SESSION_INDEX_CACHE
+    if now - ts < _CODEX_SESSION_INDEX_CACHE_TTL:
+        return cached
+    root = Path.home() / ".codex" / "sessions"
+    out: dict[str, Path] = {}
+    mtimes: dict[str, float] = {}
+    if root.exists():
+        try:
+            for fp in root.rglob("*.jsonl"):
+                thread_id = _codex_thread_id_from_path(fp)
+                if not thread_id:
+                    continue
+                try:
+                    mtime = fp.stat().st_mtime
+                except Exception:
+                    mtime = 0.0
+                if thread_id not in out or mtime > mtimes.get(thread_id, -1):
+                    out[thread_id] = fp
+                    mtimes[thread_id] = mtime
+        except Exception:
+            out = {}
+    _CODEX_SESSION_INDEX_CACHE = (now, out)
+    _CODEX_SESSION_FILE_CACHE.clear()
+    return out
+
+
 def _find_codex_session_file(thread_id: str | None) -> Path | None:
     if not thread_id:
         return None
-    root = Path.home() / ".codex" / "sessions"
-    if not root.exists():
-        return None
-    matches = list(root.rglob(f"*{thread_id}*.jsonl"))
-    if not matches:
-        return None
-    return max(matches, key=lambda p: p.stat().st_mtime)
+    thread = str(thread_id)
+    now = time.time()
+    cached = _CODEX_SESSION_FILE_CACHE.get(thread)
+    if cached and now - cached[0] < _CODEX_SESSION_INDEX_CACHE_TTL:
+        return cached[1]
+    path = _codex_session_index().get(thread)
+    if path is None:
+        # Legacy state may store a prefix or non-canonical thread id. Fall back
+        # to substring matching against the indexed filenames without walking the
+        # tree again.
+        matches = [p for tid, p in _codex_session_index().items() if thread in tid or thread in p.name]
+        if matches:
+            try:
+                path = max(matches, key=lambda p: p.stat().st_mtime)
+            except Exception:
+                path = matches[0]
+    _CODEX_SESSION_FILE_CACHE[thread] = (now, path)
+    return path
 
 def _parse_codex_timestamp(value: Any) -> int | None:
     if value is None:
@@ -1668,6 +1808,9 @@ def _recover_codex_thread_for_task(task_id: str, web: dict[str, Any]) -> str | N
     return thread_id
 
 
+_CODEX_PENDING_APPROVAL_CACHE: dict[str, tuple[str, int, int, dict[str, Any]]] = {}
+
+
 def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
     """Detect approval prompts emitted by native `codex resume` session logs.
 
@@ -1679,6 +1822,15 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
     path = _find_codex_session_file(thread_id)
     if not path:
         return {"pending": False, "reason": "no_session_file"}
+    try:
+        st = path.stat()
+        cache_key = str(thread_id or "")
+        cached = _CODEX_PENDING_APPROVAL_CACHE.get(cache_key)
+        if cached and cached[0] == str(path) and cached[1] == st.st_mtime_ns and cached[2] == st.st_size:
+            return dict(cached[3])
+    except Exception:
+        st = None
+        cache_key = str(thread_id or "")
     pending: dict[str, dict[str, Any]] = {}
     last_task_complete: dict[str, Any] | None = None
     saw_task_complete = False
@@ -1737,11 +1889,15 @@ def _codex_live_pending_approval(thread_id: str | None) -> dict[str, Any]:
                 pending.pop(cid, None)
     if pending:
         last = list(pending.values())[-1]
-        return {"pending": True, "kind": "approval_required", **last}
-    if last_task_complete:
-        return {"pending": True, **last_task_complete}
-    reason = "appended_turn_after_task_complete" if saw_task_complete else "no_pending_approval"
-    return {"pending": False, "reason": reason, "session_file": str(path)}
+        result = {"pending": True, "kind": "approval_required", **last}
+    elif last_task_complete:
+        result = {"pending": True, **last_task_complete}
+    else:
+        reason = "appended_turn_after_task_complete" if saw_task_complete else "no_pending_approval"
+        result = {"pending": False, "reason": reason, "session_file": str(path)}
+    if st is not None:
+        _CODEX_PENDING_APPROVAL_CACHE[cache_key] = (str(path), st.st_mtime_ns, st.st_size, dict(result))
+    return result
 
 def _parents_satisfied(conn, task_id: str) -> bool:
     """Whether real upstream role dependencies are satisfied.
@@ -2120,7 +2276,7 @@ def claude_web(board: str | None, task_id: str, port: int | None = None, reuse: 
             stderr_path = CLAUDE_WEB_DIR / f"{task_id}.stderr.log"
             subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
             subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
-            cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", str(tmux_name)]
+            cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
             out = stdout_path.open("ab"); err = stderr_path.open("ab")
             try:
                 proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
@@ -2213,10 +2369,31 @@ def tmux_scroll_task(task_id: str, delta: int = -800) -> dict[str, Any]:
     except Exception:
         delta_i = -800
     direction = "scroll-up" if delta_i < 0 else "scroll-down"
-    steps = max(1, min(20, abs(delta_i) // 80 or 1))
-    subprocess.run(["tmux", "copy-mode", "-e", "-t", tmux_name], check=False, env=_tmux_env())
+    steps = max(1, min(12, round(abs(delta_i) / 48) or 1))
+    pane_in_mode = False
+    scroll_position = None
+    try:
+        mode_raw = subprocess.check_output(["tmux", "display-message", "-p", "-t", tmux_name, "#{pane_in_mode}"], text=True, stderr=subprocess.STDOUT, env=_tmux_env()).strip()
+        pane_in_mode = mode_raw == "1"
+    except Exception:
+        pane_in_mode = False
+    # When already at the live bottom, downward wheel events should be cheap no-ops.
+    # Entering/canceling tmux copy-mode on every tiny downward tick makes embedded
+    # ttyd iframes feel sticky and weird.
+    if direction == "scroll-down" and not pane_in_mode:
+        return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "direction": direction, "steps": 0, "scroll_position": 0, "at_bottom": True}
+    if not pane_in_mode:
+        subprocess.run(["tmux", "copy-mode", "-e", "-t", tmux_name], check=False, env=_tmux_env())
     subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "-N", str(steps), direction], check=False, env=_tmux_env())
-    return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "direction": direction, "steps": steps}
+    if direction == "scroll-down":
+        try:
+            raw = subprocess.check_output(["tmux", "display-message", "-p", "-t", tmux_name, "#{scroll_position}"], text=True, stderr=subprocess.STDOUT, env=_tmux_env()).strip()
+            scroll_position = int(raw or "0")
+            if scroll_position <= 0:
+                subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "cancel"], check=False, env=_tmux_env())
+        except Exception:
+            scroll_position = None
+    return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "direction": direction, "steps": steps, "scroll_position": scroll_position, "at_bottom": scroll_position == 0 if scroll_position is not None else False}
 
 def _tmux_capture_text(tmux_name: str, lines: int = 5000) -> str:
     try:
@@ -2310,7 +2487,6 @@ def _hermes_attention_status(task_id: str) -> dict[str, Any]:
     # the next full-screen redraw.
     busy_markers = [
         "msg=interrupt", "compacting context", "preflight compression",
-        "running", "reading", "writing", "thinking", "working",
     ]
     if any(m in lower for m in permission_markers):
         return {"pending": True, "kind": "permission_prompt", "tmux_name": tmux_name, "tail": tail}
@@ -2433,13 +2609,35 @@ def _write_role_workspace_state(board: str, role: str, data: dict[str, Any]) -> 
     _write_json_file(path, data)
 
 
+_AVAILABLE_ROLE_DEFS_CACHE: tuple[float, str, list[dict[str, Any]]] = (0.0, "", [])
+_AVAILABLE_ROLE_DEFS_CACHE_TTL = 5.0
+_ROLES_CONFIG_CACHE: tuple[float, Any] = (0.0, None)
+_ROLES_CONFIG_CACHE_TTL = 5.0
+
+
+def _load_roles_cached() -> Any:
+    global _ROLES_CONFIG_CACHE
+    now = time.time()
+    ts, cached = _ROLES_CONFIG_CACHE
+    if cached is not None and now - ts < _ROLES_CONFIG_CACHE_TTL:
+        return cached
+    roles, _ = load_roles(CONFIG_PATH)
+    _ROLES_CONFIG_CACHE = (now, roles)
+    return roles
+
+
 def _available_role_defs(board: str) -> list[dict[str, Any]]:
+    global _AVAILABLE_ROLE_DEFS_CACHE
+    now = time.time()
+    ts, cached_board, cached_roles = _AVAILABLE_ROLE_DEFS_CACHE
+    if cached_board == str(board) and now - ts < _AVAILABLE_ROLE_DEFS_CACHE_TTL:
+        return [dict(r) for r in cached_roles]
     keys: list[str] = []
     providers: dict[str, str] = {}
     titles: dict[str, str] = {}
     descriptions: dict[str, str] = {}
     try:
-        roles, _ = load_roles(CONFIG_PATH)
+        roles = _load_roles_cached()
         for key, role in roles.items():
             if key == "default":
                 continue
@@ -2470,6 +2668,7 @@ def _available_role_defs(board: str) -> list[dict[str, Any]]:
             "status": "active" if active else "idle",
             "task_id": task_id if active else None,
         })
+    _AVAILABLE_ROLE_DEFS_CACHE = (now, str(board), [dict(r) for r in out])
     return out
 
 
@@ -3030,9 +3229,18 @@ def _newest_file_mtime(root: Path, patterns: tuple[str, ...] = ("*.log", "*.json
     return best
 
 
+_PROVIDER_ACTIVITY_CACHE: dict[tuple[str, str, str], tuple[float, int]] = {}
+_PROVIDER_ACTIVITY_CACHE_TTL = 2.0
+
+
 def _provider_activity_at(task_id: str, provider: str | None = None, thread_id: str | None = None) -> int:
-    vals: list[int] = []
     provider = (provider or "").strip().lower()
+    cache_key = (str(task_id), provider, str(thread_id or ""))
+    now = time.time()
+    cached = _PROVIDER_ACTIVITY_CACHE.get(cache_key)
+    if cached and now - cached[0] < _PROVIDER_ACTIVITY_CACHE_TTL:
+        return cached[1]
+    vals: list[int] = []
 
     codex_state = _read_json_file(_codex_web_state_path(task_id))
     if not thread_id:
@@ -3067,7 +3275,9 @@ def _provider_activity_at(task_id: str, provider: str | None = None, thread_id: 
     for sp in (_claude_web_state_path(task_id), _claude_state_path(task_id), _hermes_web_state_path(task_id), _codex_web_state_path(task_id)):
         vals.append(_file_mtime(sp))
 
-    return max(vals or [0])
+    result = max(vals or [0])
+    _PROVIDER_ACTIVITY_CACHE[cache_key] = (now, result)
+    return result
 
 
 def sessions_status(board: str) -> dict[str, Any]:
@@ -3079,30 +3289,7 @@ def sessions_status(board: str) -> dict[str, Any]:
         root_rows = conn.execute("SELECT * FROM tasks WHERE title NOT LIKE '[agency] %' AND status != 'archived' ORDER BY created_at DESC,id DESC").fetchall()
         roots = []
         def task_changed_at(task_id: str, fallback: int | None = None) -> int:
-            vals = [int(fallback or 0)]
-            try:
-                row = conn.execute("SELECT created_at,started_at,completed_at FROM tasks WHERE id=?", (task_id,)).fetchone()
-                if row:
-                    vals.extend(int(row[k] or 0) for k in ("created_at", "started_at", "completed_at"))
-            except Exception:
-                pass
-            try:
-                c = conn.execute("SELECT MAX(created_at) AS ts FROM task_comments WHERE task_id=?", (task_id,)).fetchone()
-                vals.append(int((c and c["ts"]) or 0))
-            except Exception:
-                pass
-            try:
-                e = conn.execute("SELECT MAX(created_at) AS ts FROM task_events WHERE task_id=? AND kind NOT IN ('stale','heartbeat')", (task_id,)).fetchone()
-                vals.append(int((e and e["ts"]) or 0))
-            except Exception:
-                pass
-            try:
-                row = conn.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone()
-                meta = _parse_role_body((row and row["body"]) or "") if row else {}
-                vals.append(_provider_activity_at(task_id, meta.get("provider"), None))
-            except Exception:
-                pass
-            return max(vals)
+            return task_recent_activity_at(conn, task_id, fallback)
 
         def root_changed_at(root_id: str, roles: list[dict[str, Any]], fallback: int | None = None) -> int:
             vals = [task_changed_at(root_id, fallback)]
@@ -3193,7 +3380,101 @@ def sessions_status(board: str) -> dict[str, Any]:
 
 
 
+def task_recent_activity_at(conn, task_id: str, fallback: int | None = None) -> int:
+    """Return the same activity timestamp Cockpit Recent uses for a task."""
+    vals = [int(fallback or 0)]
+    try:
+        row = conn.execute("SELECT created_at,started_at,completed_at FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row:
+            vals.extend(int(row[k] or 0) for k in ("created_at", "started_at", "completed_at"))
+    except Exception:
+        pass
+    try:
+        c = conn.execute("SELECT MAX(created_at) AS ts FROM task_comments WHERE task_id=?", (task_id,)).fetchone()
+        vals.append(int((c and c["ts"]) or 0))
+    except Exception:
+        pass
+    try:
+        e = conn.execute("SELECT MAX(created_at) AS ts FROM task_events WHERE task_id=? AND kind NOT IN ('stale','heartbeat')", (task_id,)).fetchone()
+        vals.append(int((e and e["ts"]) or 0))
+    except Exception:
+        pass
+    try:
+        row = conn.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone()
+        meta = _parse_role_body((row and row["body"]) or "") if row else {}
+        vals.append(_provider_activity_at(task_id, meta.get("provider"), None))
+    except Exception:
+        pass
+    return max(vals)
+
+
+def cleanup_completed_sessions(max_age_days: int = 3, *, dry_run: bool = False, now: int | None = None) -> dict[str, Any]:
+    """Stop tmux/ttyd sessions for role tasks completed longer than max_age_days.
+
+    Only provider process state is stopped. Kanban tasks, comments, results, and
+    provider thread/session ids remain in state files so /resume can recreate the
+    TUI if someone needs to inspect the old session later.
+    """
+    now_i = int(now or time.time())
+    cutoff = now_i - max(0, int(max_age_days)) * 86400
+    stopped: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for b in kb.list_boards(include_archived=False):
+        board = b.get("slug")
+        if not board or not kb.board_exists(board):
+            continue
+        try:
+            conn = kb.connect(board=board)
+        except Exception as exc:
+            errors.append(f"{board}: {exc}")
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT id,title,status,created_at,started_at,completed_at FROM tasks "
+                "WHERE status IN ('done','archived') AND completed_at IS NOT NULL"
+            ).fetchall()
+            candidates = []
+            for row in rows:
+                changed_at = task_recent_activity_at(conn, str(row["id"]), row["created_at"])
+                if changed_at <= cutoff:
+                    candidates.append((row, changed_at))
+        finally:
+            conn.close()
+        for row, changed_at in candidates:
+            task_id = str(row["id"])
+            states = [_read_json_file(p) for p in _state_paths_for_task(task_id) if p.exists()]
+            if not states:
+                skipped.append({"board": board, "task_id": task_id, "reason": "no provider state"})
+                continue
+            tmux_alive = any(_tmux_has_session(str(s.get("tmux_name") or s.get("tmux"))) for s in states if (s.get("tmux_name") or s.get("tmux")))
+            ttyd_alive = any(_pid_alive(s.get("pid")) or _pid_alive(s.get("readonly_pid")) for s in states)
+            if not tmux_alive and not ttyd_alive:
+                skipped.append({"board": board, "task_id": task_id, "reason": "already stopped"})
+                continue
+            try:
+                data = _stop_provider_session_state(task_id, reason=f"completed>{max_age_days}d", now=now_i, dry_run=dry_run)
+                data.update({"board": board, "title": row["title"], "completed_at": row["completed_at"], "changed_at": changed_at})
+                stopped.append(data)
+            except Exception as exc:
+                errors.append(f"{board}/{task_id}: {exc}")
+    return {"ok": not errors, "max_age_days": max_age_days, "cutoff": cutoff, "dry_run": dry_run, "stopped": stopped, "skipped_count": len(skipped), "errors": errors}
+
+
+_COMPLETED_SESSION_CLEANUP_LAST = 0.0
+_COMPLETED_SESSION_CLEANUP_INTERVAL_SECONDS = 3600.0
+
+def _auto_cleanup_completed_sessions() -> dict[str, Any]:
+    global _COMPLETED_SESSION_CLEANUP_LAST
+    now = time.time()
+    if now - _COMPLETED_SESSION_CLEANUP_LAST < _COMPLETED_SESSION_CLEANUP_INTERVAL_SECONDS:
+        return {"ok": True, "skipped": "throttled"}
+    _COMPLETED_SESSION_CLEANUP_LAST = now
+    return cleanup_completed_sessions(max_age_days=3, dry_run=False, now=int(now))
+
+
 def sessions_all() -> dict[str, Any]:
+    cleanup = _auto_cleanup_completed_sessions()
     roots: list[dict[str, Any]] = []
     boards = []
     for b in sorted(kb.list_boards(), key=lambda x: x.get('created_at') or 0, reverse=True):
@@ -3263,7 +3544,7 @@ def sessions_all() -> dict[str, Any]:
             break
     if not primary_board and roots:
         primary_board = roots[0].get("board")
-    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": _available_role_defs(INDEPENDENT_ROLE_BOARD)}
+    return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": _available_role_defs(INDEPENDENT_ROLE_BOARD), "completed_session_cleanup": cleanup}
 
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
@@ -3492,6 +3773,15 @@ class H(BaseHTTPRequestHandler):
                     data = core.codex_web(board, task_id, reuse=False)
                 body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith('/maintenance/cleanup-completed-sessions'):
+            qs = urlparse(self.path).query
+            dry = 'dry_run=1' in qs or 'dry_run=true' in qs
+            try:
+                days = int((qs.split('days=',1)[1].split('&',1)[0]) if 'days=' in qs else 3)
+            except Exception:
+                days = 3
+            body = json.dumps(core.cleanup_completed_sessions(max_age_days=days, dry_run=dry), ensure_ascii=False, indent=2).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/sessions':
             body = json.dumps(core.sessions_all(), ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return

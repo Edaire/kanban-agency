@@ -4,8 +4,35 @@
 <script id="kanban-wheel-scroll-only">
 (function(){
   function taskId(){
-    var m=(document.title||'').match(/t_[A-Za-z0-9_]+/);
-    return m?m[0]:null;
+    var sources=[document.title||'', location.pathname||'', location.href||''];
+    for(var i=0;i<sources.length;i++){
+      var m=sources[i].match(/t_[A-Za-z0-9_]+/);
+      if(m) return m[0];
+    }
+    return null;
+  }
+  var pending=0, raf=0, inFlight=false;
+  function normalizedDelta(e){
+    var d=e.deltaY||0;
+    if(e.deltaMode===1) d*=16;
+    else if(e.deltaMode===2) d*=window.innerHeight||800;
+    return d;
+  }
+  function flush(){
+    raf=0;
+    var task=taskId();
+    var delta=pending;
+    pending=0;
+    if(!task || !delta) return;
+    // Avoid a backlog of stale scroll requests; merge new wheel deltas into the
+    // next frame while tmux catches up. This feels much less rubber-band-y in an iframe.
+    if(inFlight){ pending+=delta; if(!raf) raf=requestAnimationFrame(flush); return; }
+    inFlight=true;
+    try{
+      fetch('http://127.0.0.1:8766/tmux-scroll/'+encodeURIComponent(task)+'?delta='+encodeURIComponent(Math.round(delta)), {mode:'no-cors', cache:'no-store'})
+        .catch(function(){})
+        .finally(function(){ inFlight=false; if(pending && !raf) raf=requestAnimationFrame(flush); });
+    }catch(_e){ inFlight=false; }
   }
   function install(){
     if(window.__kanbanWheelScrollOnly)return;
@@ -16,9 +43,8 @@
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
-      try{
-        fetch('http://127.0.0.1:8766/tmux-scroll/'+encodeURIComponent(task)+'?delta='+encodeURIComponent(Math.round(e.deltaY)), {mode:'no-cors', cache:'no-store'});
-      }catch(_e){}
+      pending += normalizedDelta(e);
+      if(!raf) raf=requestAnimationFrame(flush);
     }, {capture:true, passive:false});
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',install); else install();

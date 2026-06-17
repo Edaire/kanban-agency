@@ -39,9 +39,24 @@ def test_tmux_scroll_task_sends_copy_mode_scroll(monkeypatch):
     assert any(cmd[:4] == ['tmux', 'send-keys', '-t', 'kanban-codex-t1'] and 'scroll-up' in cmd for cmd in calls)
 
     calls.clear()
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *args, **kwargs: '1')
     out = core.tmux_scroll_task('t1', delta=800)
     assert out['ok'] is True
     assert any('scroll-down' in cmd for cmd in calls)
+
+
+def test_tmux_scroll_down_at_live_bottom_is_noop(monkeypatch):
+    core = load_core()
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux_name': 'kanban-codex-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+    calls = []
+    monkeypatch.setattr(core.subprocess, 'run', lambda cmd, **kwargs: calls.append(cmd) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(core.subprocess, 'check_output', lambda *args, **kwargs: '0')
+    out = core.tmux_scroll_task('t1', delta=120)
+    assert out['ok'] is True
+    assert out['steps'] == 0
+    assert out['at_bottom'] is True
+    assert calls == []
 
 
 def test_gateway_has_tmux_scroll_route():
