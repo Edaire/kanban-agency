@@ -473,12 +473,42 @@ def _read_claude_state(task_id: str) -> dict[str, Any]:
     return _read_json_file(_claude_state_path(task_id))
 
 
+def _strip_kanban_agency_directives(text: str) -> str:
+    """Remove kanban-agency control markers from user-facing task text.
+
+    Root task bodies use @kanban-agency/workdir/workflow as machine-readable
+    directives. Role prompts must not present those directives as the business
+    task description, otherwise agents chase the plugin marker itself.
+    """
+    lines: list[str] = []
+    in_front_matter = True
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        lower = stripped.lower()
+        if in_front_matter and (not stripped):
+            # Preserve a paragraph break only after real text starts.
+            continue
+        if in_front_matter and (
+            stripped == "@kanban-agency"
+            or lower.startswith("workdir:")
+            or lower.startswith("workflow:")
+            or lower.startswith("provider:")
+            or lower.startswith("roles:")
+            or lower.startswith("kanban:")
+        ):
+            continue
+        in_front_matter = False
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _extract_root_task_body(role_body: str) -> str:
     marker = "root_task_body:\n```text\n"
     if marker not in role_body:
-        return role_body
+        return _strip_kanban_agency_directives(role_body)
     rest = role_body.split(marker, 1)[1]
-    return rest.split("\n```", 1)[0].strip()
+    return _strip_kanban_agency_directives(rest.split("\n```", 1)[0])
 
 def _claude_prompt(task: kb.Task, meta: dict[str, str]) -> str:
     """Minimal native Claude prompt for ops-style sessions."""
@@ -520,6 +550,26 @@ def _tmux_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("TMUX", None)
     return env
+
+
+def _codex_yolo_enabled(meta: dict[str, str]) -> bool:
+    """Use Codex YOLO mode for non-ops Codex roles.
+
+    Ops/operator sessions may touch external systems or production-like resources,
+    so they keep normal approval prompts. Development/research/test roles run in
+    the local workspace and can skip repetitive approvals.
+    """
+    role = str((meta or {}).get("role") or "").strip().lower()
+    return role not in {"ops", "operator"}
+
+
+def _codex_command(meta: dict[str, str], *, resume_thread_id: str | None = None) -> str:
+    parts = ["codex"]
+    if _codex_yolo_enabled(meta):
+        parts.append("--dangerously-bypass-approvals-and-sandbox")
+    if resume_thread_id:
+        parts.extend(["resume", shlex.quote(str(resume_thread_id))])
+    return "exec " + " ".join(parts)
 
 
 _TMUX_SESSIONS_CACHE: tuple[float, set[str]] = (0.0, set())
@@ -595,7 +645,7 @@ def _tmux_capture(tmux_name: str, lines: int = 80) -> str:
 
 def _paste_prompt(tmux_name: str, prompt_path: Path, submit: bool) -> None:
     subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False, env=_tmux_env())
-    subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False, env=_tmux_env())
+    subprocess.run(["tmux", "paste-buffer", "-r", "-t", str(tmux_name)], check=False, env=_tmux_env())
     if submit:
         subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False, env=_tmux_env())
 
@@ -678,7 +728,7 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
         time.sleep(1.0)
         # Paste the active task prompt into the interactive TUI and submit it.
         subprocess.run(["tmux", "load-buffer", "-t", tmux_name, str(prompt_path)], check=False)
-        subprocess.run(["tmux", "paste-buffer", "-t", tmux_name], check=False)
+        subprocess.run(["tmux", "paste-buffer", "-r", "-t", tmux_name], check=False)
         subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
         _ensure_prompt_submitted(str(tmux_name), prompt_path)
     CLAUDE_WEB_DIR.mkdir(parents=True, exist_ok=True)
@@ -768,7 +818,7 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     started_at = int(time.time())
     submit_info: dict[str, Any] = {"submitted": False, "reason": "reused_existing_tmux"}
     if not _tmux_has_session(str(tmux_name)):
-        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec codex"], check=True, env=_tmux_env())
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_command(meta)], check=True, env=_tmux_env())
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False, env=_tmux_env())
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False, env=_tmux_env())
         _wait_for_tui_ready(str(tmux_name))
@@ -840,12 +890,12 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     prompt_path.write_text(_codex_prompt(task, meta), encoding="utf-8")
     started_at = int(time.time())
     if not _tmux_has_session(str(tmux_name)):
-        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", "exec codex"], check=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_command(meta)], check=True)
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
         time.sleep(1.0)
         subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
-        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
+        subprocess.run(["tmux", "paste-buffer", "-r", "-t", str(tmux_name)], check=False)
         # Deliberately do NOT press Enter: user starts the actual conversation.
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
@@ -913,7 +963,7 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
         time.sleep(1.0)
         subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(prompt_path)], check=False)
-        subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
+        subprocess.run(["tmux", "paste-buffer", "-r", "-t", str(tmux_name)], check=False)
         subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
@@ -1331,7 +1381,7 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                 subprocess.run([
                     "tmux", "new-session", "-d", "-s", tmux_name,
                     "-c", str(cwd),
-                    "bash", "-lc", f"exec codex resume {shlex.quote(thread_id)}",
+                    "bash", "-lc", _codex_command(meta, resume_thread_id=thread_id),
                 ], check=True, env=_tmux_env())
             cmd = [
                 ttyd,
@@ -1351,7 +1401,7 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                 "--writable",
                 "--client-option", f"titleFixed=Codex {task_id}",
                 "--cwd", str(cwd),
-                "bash", "-lc", f"exec codex resume {shlex.quote(thread_id)}",
+                "bash", "-lc", _codex_command(meta, resume_thread_id=thread_id),
             ]
         readonly_proc = None
         readonly_url = None
@@ -1475,7 +1525,7 @@ def continue_comments(board: str, listen: str = "ws://127.0.0.1:8795", dry_run: 
                 d = CLAUDE_RUN_DIR / task.id; d.mkdir(parents=True, exist_ok=True)
                 msg_path = d / f"comment-{comment.id}.txt"; msg_path.write_text(comment.body or "", encoding="utf-8")
                 subprocess.run(["tmux", "load-buffer", "-t", str(tmux_name), str(msg_path)], check=False)
-                subprocess.run(["tmux", "paste-buffer", "-t", str(tmux_name)], check=False)
+                subprocess.run(["tmux", "paste-buffer", "-r", "-t", str(tmux_name)], check=False)
                 subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
                 state.update({"state": "blocked", "reason": "interactive_session", "last_human_comment_id": comment.id, "continued_at": int(time.time())})
                 _write_json_file(_claude_state_path(task.id), state)
@@ -2082,10 +2132,7 @@ rules:
 
 root_task_body:
 ```text
-@kanban-agency
-workdir: {workdir}
-
-{instruction}
+{_strip_kanban_agency_directives(instruction)}
 ```
 
 This is a kanban-agency role card. The root_task_body is the concrete active task.
@@ -3549,11 +3596,13 @@ def sessions_all() -> dict[str, Any]:
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
 *{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:hidden;padding:10px;display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0}#sessions{min-height:0;overflow:auto;padding-right:.15rem;scrollbar-width:none;-ms-overflow-style:none}#sessions::-webkit-scrollbar{width:0;height:0;display:none}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr);grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.recent-workset{margin:0 0 16px;padding:8px 8px 10px;border:1px solid #26313d;border-radius:9px;background:#2d1b3d}.kanbans-group{border-top:2px solid #334155;padding-top:10px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.st{display:inline-block;width:1.15em;margin-right:4px;font-weight:800;text-align:center}.st-attention{color:#f59e0b}.st-blocked{color:#fb7185}.st-running{color:#38bdf8}.st-ready{color:#a78bfa}.st-review{color:#fbbf24}.st-todo{color:#94a3b8}.st-done{color:#22c55e}.st-idle{color:#64748b}.st-missing{color:#475569}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.role-card{margin:.38em 0 .62em;padding:.38em .54em;border:1px solid #334155;border-radius:.54em;background:#101827;cursor:pointer;font-size:1em}.role-card:hover{background:#172033;border-color:#60a5fa}.role-card-head{display:flex;align-items:center;justify-content:space-between;gap:.46em}.role-title{display:flex;align-items:center;gap:.46em;min-width:0}.role-logo{display:inline-flex;align-items:center;justify-content:center;inline-size:1.35em;block-size:1.35em;border-radius:.38em;font-size:.85em;font-weight:900;flex:0 0 auto}.role-name{font-weight:700;color:#e5e7eb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.role-provider{font-size:.85em;text-transform:uppercase;border:1px solid #334155;border-radius:999px;padding:0 .46em;line-height:1.35}.provider-codex .role-logo,.role-modal.provider-codex .role-logo{background:#10233f;color:#bfdbfe}.provider-codex .role-provider{color:#bfdbfe;border-color:#3b82f6}.provider-claude .role-logo,.role-modal.provider-claude .role-logo{background:#2d1b3d;color:#e9d5ff}.provider-claude .role-provider{color:#e9d5ff;border-color:#a855f7}.provider-hermes .role-logo,.role-modal.provider-hermes .role-logo{background:#0f2f2b;color:#99f6e4}.provider-hermes .role-provider{color:#99f6e4;border-color:#14b8a6}.provider-human .role-logo,.role-modal.provider-human .role-logo{background:#3a2a10;color:#fde68a}.provider-human .role-provider{color:#fde68a;border-color:#f59e0b}.role-desc{margin-top:.23em;color:#cbd5e1;font-size:1em;line-height:1.25;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.role-action{margin-top:.23em;color:#94a3b8;font-size:.92em;line-height:1.2}.role-modal h2{display:flex;align-items:center;gap:8px;margin:0 0 4px}.role-detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:12px}.role-detail-label{color:#94a3b8}.role-list{margin:0;padding-left:18px}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.role-form label{display:block;margin-top:8px;color:#94a3b8;font-size:12px}.role-form input,.role-form textarea,.role-form select{width:100%;margin-top:4px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px}.role-form textarea{min-height:70px}.role-source{margin-top:8px;border:1px solid #26313d;border-radius:8px;padding:8px;background:#0b0f14}.role-source-path{font-size:11px;color:#93c5fd;margin-bottom:4px;word-break:break-all}.role-source textarea{min-height:180px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.role-form-msg{margin-top:8px;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.pane-action{float:right;margin-left:8px;border:1px solid #334155;border-radius:6px;padding:1px 6px;background:#0f172a;font-size:11px;line-height:16px;cursor:pointer}.pane-action.complete{color:#bfdbfe;background:#10233f;border-color:#3b82f6}.pane-action.complete:hover{color:#eff6ff;background:#1e3a5f;border-color:#60a5fa}.pane-action.reopen{color:#bbf7d0;background:#0f2a1a;border-color:#22c55e}.pane-action.reopen:hover{color:#dcfce7;background:#14532d;border-color:#4ade80}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
-</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="analyst">analyst</option><option value="architect">architect</option><option value="developer">developer</option><option value="tester">tester</option><option value="ops">ops</option><option value="assistant">assistant</option></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><div id="genericModal" style="display:none;position:fixed;inset:0;background:#0009;z-index:10000;align-items:center;justify-content:center" onclick="if(event.target===this)closeModal()"><div id="genericModalBody" style="width:min(620px,92vw);max-height:86vh;overflow:auto;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"></div></div><script>
+</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><div id="genericModal" style="display:none;position:fixed;inset:0;background:#0009;z-index:10000;align-items:center;justify-content:center" onclick="if(event.target===this)closeModal()"><div id="genericModalBody" style="width:min(620px,92vw);max-height:86vh;overflow:auto;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"></div></div><script>
 const storageKey='kanban-cockpit-state';let sessions={roots:[]};let sideMode='sessions';let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let collapsedRoots=new Set();let collapsedKanbans=new Set();let recentTasks={};let roleRuleSources={};let lastSideHtml='';let panesRenderedWithData=false;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,sideMode,panes,active,expanded:[...expandedRoots],collapsedRoots:[...collapsedRoots],collapsedKanbans:[...collapsedKanbans],recentTasks}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(s.sideMode)sideMode=s.sideMode;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded);if(Array.isArray(s.collapsedRoots))collapsedRoots=new Set(s.collapsedRoots);if(Array.isArray(s.collapsedKanbans))collapsedKanbans=new Set(s.collapsedKanbans);recentTasks=(s.recentTasks&&typeof s.recentTasks==='object')?s.recentTasks:{}}catch(e){recentTasks={}}}
 function syncTaskRoleVisibility(){const wrap=document.getElementById('taskRoleWrap');if(wrap)wrap.style.display=(document.getElementById('newTaskMode')?.value==='independent')?'block':'none'}
 function boardOptionsHtml(selected){return (sessions.boards||[]).map(b=>`<option value="${esc(b.board)}" ${b.board===selected?'selected':''}>${esc(b.title||b.board)}</option>`).join('')}
-function showTaskDialog(b){const el=document.getElementById('taskDialog');const sel=document.getElementById('newTaskBoard');if(sel)sel.innerHTML=boardOptionsHtml(b||'');if(el)el.style.display='flex';syncTaskRoleVisibility();setTimeout(()=>document.getElementById('newTaskTitle')?.focus(),0)}
+function roleOptionsHtml(selected){const catalog=roleCatalog();return catalog.map(r=>`<option value="${esc(r.role)}" ${r.role===selected?'selected':''}>${esc(r.title||r.role)} (${esc(r.provider||'codex')})</option>`).join('')}
+function syncTaskRoleOptions(){const sel=document.getElementById('newTaskRole');if(!sel)return;const prev=sel.value;sel.innerHTML=roleOptionsHtml(prev);if(prev&&[...sel.options].some(o=>o.value===prev))sel.value=prev}
+function showTaskDialog(b){const el=document.getElementById('taskDialog');const sel=document.getElementById('newTaskBoard');if(sel)sel.innerHTML=boardOptionsHtml(b||'');syncTaskRoleOptions();if(el)el.style.display='flex';syncTaskRoleVisibility();setTimeout(()=>document.getElementById('newTaskTitle')?.focus(),0)}
 function hideTaskDialog(){const el=document.getElementById('taskDialog');if(el)el.style.display='none'}
 function slugifyBoardName(name){return String(name||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)}
 function showBoardDialog(){showModal(`<div class="role-modal"><h2>New Kanban</h2><div class="role-form"><label>Slug <span class="small">stable id, e.g. bhumi_claw</span></label><input id="boardNewSlug" placeholder="kanban_slug"><label>Name</label><input id="boardNewName" placeholder="Display name"><label>Workdir <span class="small">absolute project path</span></label><input id="boardNewWorkdir" placeholder="/Users/admin/code/project"><label>Description</label><textarea id="boardNewDesc" placeholder="optional"></textarea><div id="boardNewMsg" class="role-form-msg"></div></div><div class="modal-actions"><button class="layoutBtn" onclick="closeModal()">Cancel</button><button class="layoutBtn active" onclick="createBoard()">Create</button></div></div>`);setTimeout(()=>{const name=document.getElementById('boardNewName');const slug=document.getElementById('boardNewSlug');if(name&&slug){name.oninput=()=>{if(!slug.dataset.touched)slug.value=slugifyBoardName(name.value)};slug.oninput=()=>{slug.dataset.touched='1'}};document.getElementById('boardNewName')?.focus()},0)}
@@ -3622,7 +3671,7 @@ function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld
 function renderPanes(){let html=''; for(const id of visibleIds())html+=paneHtml(paneIndex(id)); document.getElementById('panes').innerHTML=html; document.querySelectorAll('.pane').forEach((pane,pos)=>wirePane(pane,paneIndex(visibleIds()[pos])));}
 function updatePaneHeaders(){const roles=rolesById(); document.querySelectorAll('.pane').forEach((pane,pos)=>{const i=Number(pane.querySelector('.ph')?.dataset.pane);const r=roles[panes[i]]; const h=pane.querySelector('.ph'); if(h&&r){const next=paneHeader(i,r); if(h.dataset.last!==next){h.innerHTML=next;h.dataset.last=next;}}});}
 function updatePaneFrames(){const roles=rolesById();document.querySelectorAll('iframe[data-task]').forEach(frame=>{const r=roles[frame.dataset.task];if(!r||frame.dataset.task!==r.task_id)return;const desired=desiredPaneSrc(r);if(desired&&frame.src!==desired)frame.src=desired;});}
-async function refresh(){try{const r=await fetch('/sessions',{cache:'no-store'});sessions=await r.json();seedRecentFromPanes();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); setupArchiveDrop(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
+async function refresh(){try{const r=await fetch('/sessions',{cache:'no-store'});sessions=await r.json();syncTaskRoleOptions();seedRecentFromPanes();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); setupArchiveDrop(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
 loadState();if(!layouts[layout])layout='3';paneCount=visibleIds().length;renderLayouts();document.getElementById('panes').className='panes layout-'+layout;setInterval(refresh,3000);refresh();
 </script></body></html>"""
     return html.replace("__BOARD__", board).replace("__EMBED__", "hiddenHead" if embed else "")
