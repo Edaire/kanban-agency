@@ -107,7 +107,7 @@ def test_sessions_all_exposes_single_global_role_catalog(env):
 
 
 
-def test_independent_role_sessions_are_collapsed_and_newest_first(env, monkeypatch):
+def test_independent_role_sessions_render_as_task_roots_newest_first(env, monkeypatch):
     core = load_core()
     board = make_board(core)
     monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: {'ok': True, 'state': {'thread_id': 'thread', 'tmux_name': 'tmux'}})
@@ -124,10 +124,11 @@ def test_independent_role_sessions_are_collapsed_and_newest_first(env, monkeypat
         conn.close()
 
     data = core.sessions_status(core.INDEPENDENT_ROLE_BOARD)
-    roots = {r['title']: r for r in data['roots']}
+    roots = data['roots']
 
-    assert roots['researcher']['roles'][0]['task_id'] == first['task_id']
-    assert roots['developer']['roles'][0]['task_id'] == second['task_id']
+    assert [r['root_id'] for r in roots] == [second['task_id'], first['task_id']]
+    assert roots[0]['roles'][0]['task_id'] == second['task_id']
+    assert roots[1]['roles'][0]['task_id'] == first['task_id']
 
 
 
@@ -170,7 +171,7 @@ def test_ops_independent_role_defaults_to_independent_board_workdir(env, monkeyp
 
 
 
-def test_independent_role_sessions_group_by_role_not_independent_tasks_root(env, monkeypatch):
+def test_independent_role_sessions_render_as_task_roots(env, monkeypatch):
     core = load_core()
     source_board = make_board(core, 'source_feature_board')
     monkeypatch.setattr(core, 'codex_native_init_role_session', lambda board, task, meta: {'ok': True, 'state': {'thread_id': 'thread', 'tmux_name': 'tmux'}})
@@ -178,9 +179,9 @@ def test_independent_role_sessions_group_by_role_not_independent_tasks_root(env,
     opened = core.open_role_workspace(source_board, 'researcher')
     data = core.sessions_status(core.INDEPENDENT_ROLE_BOARD)
 
-    assert not any(r['title'] == 'Independent tasks' for r in data['roots'])
-    root = next(r for r in data['roots'] if r['root_id'] == 'role:researcher')
-    assert root['title'] == 'researcher'
+    root = next(r for r in data['roots'] if r['root_id'] == opened['task_id'])
+    assert root['title'] in {'等待输入', '空白会话'}
+    assert root['independent'] is True
     assert root['roles'][0]['task_id'] == opened['task_id']
     assert root['roles'][0]['display_title'] in {'等待输入', '空白会话'}
 

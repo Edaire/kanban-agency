@@ -25,7 +25,10 @@ def test_roles_tab_is_role_definition_catalog_not_session_history():
     assert 'click · drag' in block
     assert 'role-logo' in block
     assert 'providerClass(rr.provider)' in block
+    assert 'Role sessions' not in block
     assert 'roleSessions' not in block
+    assert 'roleSessionContract' not in block
+    assert "att?'🔔'" not in block
     assert 'roleLabel(r)' not in block
     assert "document.querySelectorAll('.chip,.role-card')" in html
     assert "showRoleDetails(b.dataset.role)" in html

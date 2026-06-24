@@ -3485,23 +3485,16 @@ def sessions_status(board: str, *, auto_advance: bool = True) -> dict[str, Any]:
 
         if board == INDEPENDENT_ROLE_BOARD:
             rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND body LIKE '%@kanban-agency-independent%' ORDER BY created_at DESC,id DESC").fetchall()
-            grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
             for row in rows:
                 item = role_item(row)
-                role = str(item.get("role") or "unknown")
-                grouped.setdefault(role, []).append(item)
-            for role, items in grouped.items():
-                items.sort(key=lambda r: (int(r.get("created_at") or 0), str(r.get("task_id") or "")), reverse=True)
-                attention = sum(1 for r in items if r.get("pending_approval"))
-                changed_at = max([int(r.get("changed_at") or r.get("created_at") or 0) for r in items] or [0])
                 roots.append({
-                    "root_id": f"role:{role}",
-                    "title": role,
-                    "status": "running" if any(r.get("task_status") not in {"done", "archived"} for r in items) else "done",
-                    "collapsed": True,
-                    "attention": attention,
-                    "changed_at": changed_at,
-                    "roles": items,
+                    "root_id": item.get("task_id"),
+                    "title": item.get("display_title") or item.get("title") or "独立任务",
+                    "status": item.get("task_status") or "running",
+                    "collapsed": item.get("task_status") in {"done", "archived"},
+                    "attention": 1 if item.get("pending_approval") else 0,
+                    "changed_at": item.get("changed_at") or item.get("created_at"),
+                    "roles": [item],
                     "independent": True,
                 })
             return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance_result, "available_roles": _available_role_defs(board)}
@@ -3781,11 +3774,8 @@ async function renameTask(task,current){if(!task)return;const title=prompt('Rena
 function clearDragging(){document.body.classList.remove('dragging')}
 window.addEventListener('mouseup',clearDragging,true);window.addEventListener('pointerup',clearDragging,true);window.addEventListener('blur',clearDragging,true);document.addEventListener('visibilitychange',clearDragging,true);
 function setSideMode(mode){sideMode=mode==='roles'?'roles':'sessions';saveState();lastSideHtml='';renderSide()}
-function roleAttention(){return sessions.roots.filter(root=>String(root.root_id||'').startsWith('role:')).reduce((a,x)=>a+(x.attention||0),0)}
-function kanbanAttention(){return sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:')).reduce((a,x)=>a+(x.attention||0),0)}
-function syncSideTabs(){const s=document.getElementById('tabSessions');const r=document.getElementById('tabRoles');const ka=kanbanAttention();const ra=roleAttention();if(s){s.innerHTML='Kanbans'+(ka?` 🔔 ${ka}`:'');s.classList.toggle('active',sideMode!=='roles')}if(r){r.innerHTML='Roles'+(ra?` 🔔 ${ra}`:'');r.classList.toggle('active',sideMode==='roles')}}
-function roleSessionRoots(){return sessions.roots.filter(root=>String(root.root_id||'').startsWith('role:'))}
-function roleSessionContract(){const roleRoot={attention:0,roles:[]};const rr={active:false};const att=roleRoot.attention||0;const roleSessions=roleRoot.roles||[];const roleDef=`class="chip role-def ${rr.active?'active':'idle'}"`;const roleBell=`${att?'🔔':(rr.active?'●':'○')}`;for(const r of roleSessions){`${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)}`;}return att||roleDef||roleBell}
+function kanbanAttention(){return sessions.roots.reduce((a,x)=>a+(x.attention||0),0)}
+function syncSideTabs(){const s=document.getElementById('tabSessions');const r=document.getElementById('tabRoles');const ka=kanbanAttention();if(s){s.innerHTML='Kanbans'+(ka?` 🔔 ${ka}`:'');s.classList.toggle('active',sideMode!=='roles')}if(r){r.innerHTML='Roles';r.classList.toggle('active',sideMode==='roles')}}
 function renderRoleSide(){let html='<div class="board-group roles-catalog"><div class="board-title">Roles <span class="small">definitions</span></div>'; const catalog=roleCatalog(); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const pc=providerClass(rr.provider);html+=`<div class="role-card ${pc}" draggable="true" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}" title="Click for details; drag to pane to open ${esc(rr.role)}"><div class="role-card-head"><div class="role-title"><span class="role-logo">${providerLogo(rr.provider)}</span><span class="role-name">${esc(rr.title||rr.role)}</span></div><span class="role-provider">${esc(rr.provider||'codex')}</span></div><div class="role-desc">${esc(rr.description||'No description')}</div><div class="role-action">click · drag</div></div>`} html+='</div>'; return html}
 function pruneRecent(){recentTasks=recentTasks||{};const byId=rolesById();const cutoff=Math.floor(Date.now()/1000)-3*24*60*60;const keep=Object.entries(recentTasks||{}).filter(([id,ts])=>byId[id]&&Number(ts||0)>=cutoff).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,8);recentTasks=Object.fromEntries(keep)}
 function touchRecent(task){if(!task)return;recentTasks=recentTasks||{};recentTasks[task]=Math.floor(Date.now()/1000);pruneRecent();saveState()}

@@ -45,10 +45,10 @@ def test_cockpit_distinguishes_role_definitions_from_role_sessions():
     core = load_core()
     html = core._cockpit_html('some_board')
 
-    assert 'class="chip role-def ${rr.active?\'active\':\'idle\'}"' in html
-    assert "rr.active?'active':'idle'" in html
-    assert "data-role" in html
-    assert "data-task" in html
+    assert 'class="role-card ${pc}"' in html
+    assert 'data-role="${esc(rr.role)}"' in html
+    assert 'data-task="${esc(r.task_id||\'\')}"' in html
+    assert 'class="chip role-def' not in html
 
 
 def test_cockpit_sidebar_labels_roles_and_sessions():
@@ -82,23 +82,39 @@ def test_cockpit_left_sidebar_tabs_roles_and_sessions_without_touching_panes():
 
 
 
-def test_cockpit_roles_tab_groups_sessions_under_roles():
+def test_cockpit_does_not_special_case_independent_role_roots():
     core = load_core()
     html = core._cockpit_html('__all__')
 
-    assert 'function roleSessionRoots' in html
-    assert "String(root.root_id||'').startsWith('role:')" in html
-    assert 'for(const r of roleSessions)' in html
+    assert 'function isRoleSessionRoot(root)' not in html
+    assert 'function roleSessionRoots' not in html
+    assert "String(root.root_id||'').startsWith('role:')" not in html
+    start = html.index('function renderRoleSide()')
+    end = html.index('function pruneRecent()', start)
+    block = html[start:end]
+    assert 'roleSessionRoots' not in block
+    assert 'Role sessions' not in block
+    assert 'data-task="${esc(r.task_id||\'\')}"' not in block
 
 
 
-def test_sessions_tab_uses_role_labels_but_roles_tab_uses_content_titles():
+def test_sessions_tab_uses_same_role_labels_for_all_roots():
     core = load_core()
     html = core._cockpit_html('__all__')
 
     assert 'function renderRoleSide' in html
     assert 'function renderSessionSide' in html
-    # Roles tab lists role-owned sessions by content/problem title.
-    assert '${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)}' in html
-    # Sessions tab keeps the compact role label view; status text is represented by icons.
     assert '${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}' in html
+    assert "${roleRoot?esc(r.display_title||r.role):roleLabel(r)}" not in html
+
+
+def test_recent_uses_same_collapse_rule_for_all_roots():
+    core = load_core()
+    html = core._cockpit_html('__all__')
+
+    start = html.index('function renderRecentWorkset()')
+    end = html.index('function renderSessionSide()', start)
+    block = html[start:end]
+    assert "const roleRoot=" not in block
+    assert "const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key))" in block
+    assert '${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}' in block

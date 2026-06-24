@@ -13,11 +13,13 @@ def load_core():
     return mod
 
 
-def test_cockpit_roles_tab_shows_attention_count_and_role_group_bell():
+def test_cockpit_shows_attention_bell_only_on_kanbans_tab():
     core = load_core()
     html = core._cockpit_html('__all__')
-    assert 'function roleAttention()' in html
-    assert "r.innerHTML='Roles'+(ra?` 🔔 ${ra}`:'')" in html
+    assert "function kanbanAttention(){return sessions.roots.reduce((a,x)=>a+(x.attention||0),0)}" in html
     assert "s.innerHTML='Kanbans'+(ka?` 🔔 ${ka}`:'')" in html
-    assert "const att=roleRoot.attention||0" in html
-    assert "${att?'🔔':(rr.active?'●':'○')}" in html
+    assert "r.innerHTML='Roles'" in html
+    assert "r.innerHTML='Roles'+(ra?` 🔔 ${ra}`:'')" not in html
+    assert 'function roleAttention()' not in html
+    assert 'function roleSessionContract()' not in html
+    assert 'roleBell' not in html
