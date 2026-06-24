@@ -232,7 +232,7 @@ analyst -> architect -> developer -> tester
 
 ## 浏览器 Cockpit
 
-启动本地 gateway：
+本机使用时启动本地 gateway：
 
 ```bash
 scripts/kanban-agency codex-web-gateway --port 8766
@@ -255,6 +255,35 @@ http://127.0.0.1:8766/cockpit
 /resume/<task_id>           恢复/重建停止的 session
 /tmux-scroll/<task_id>      ttyd wheel handler 使用的 tmux copy-mode 滚动接口
 ```
+
+## 远程控制
+
+远程控制复用同一个 `codex-web-gateway`；它不会引入第二套任务数据库，也不是业务 Relay。认证、鉴权、CSRF 检查、写租约、session 查找和 ttyd backend 选择仍由 gateway 负责。
+
+使用 auth 文件启动 remote mode：
+
+```bash
+scripts/kanban-agency codex-web-gateway \
+  --remote \
+  --host 127.0.0.1 \
+  --port <gateway_port> \
+  --auth-file <remote-auth.json>
+```
+
+remote auth 文件定义 readonly/writable 两类登录码，以及浏览器实际访问的 Host 和 Origin：
+
+```json
+{
+  "readonly_secret": "<readonly secret>",
+  "writable_secret": "<writable secret>",
+  "allowed_hosts": ["remote.example.com"],
+  "allowed_origins": ["https://remote.example.com"]
+}
+```
+
+写操作需要 writable 登录态和 CSRF。远程 ttyd 访问统一经过 `/ttyd/<task_id>`，由 gateway 选择 readonly 或 writable backend、执行写租约，并避免暴露 raw ttyd credential。手机端可以打开 `/mobile`；当嵌入 terminal 无法稳定接收软键盘输入时，底部输入栏会提交到 `/mobile-input/<task_id>`，gateway 会先校验 writable 权限、CSRF、允许的 Origin 和写租约，再把文本和 Enter 发送到任务记录的 tmux session。
+
+remote mode 不内置 HTTPS/TLS 终止。公网访问应放在 SSH 隧道、VPN/私有网络，或 TLS 反向代理之后。ECS、反向代理和 relay 拓扑见 [docs/remote-control-deployment.md](docs/remote-control-deployment.md)。
 
 ## Codex 和 Claude Code 接入
 
@@ -316,7 +345,7 @@ PYTHONPATH=/path/to/hermes-agent python -m pytest tests -q
 当前本地验证：
 
 ```text
-49 passed
+222 passed
 ```
 
 ## 开源前安全检查

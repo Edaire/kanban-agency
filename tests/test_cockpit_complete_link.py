@@ -77,4 +77,4 @@ def test_cockpit_html_has_complete_button_for_pending_sessions(env):
     assert 'async function completeTask(task)' in html
     assert "fetch('/complete/'" in html
     assert 'Complete in Kanban' in html
-    assert 'Waiting for Kanban Complete' in html
+    assert 'Waiting for Kanban Complete' not in html

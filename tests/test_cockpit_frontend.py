@@ -100,5 +100,5 @@ def test_sessions_tab_uses_role_labels_but_roles_tab_uses_content_titles():
     assert 'function renderSessionSide' in html
     # Roles tab lists role-owned sessions by content/problem title.
     assert '${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)}' in html
-    # Sessions tab keeps the classic role label view.
-    assert '${sym(r.task_status,r.pending_approval)} ${esc(r.role)} <span class="small">${esc(displayStatus(r))}</span>${paneRef(r.task_id)}' in html
+    # Sessions tab keeps the compact role label view; status text is represented by icons.
+    assert '${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}' in html

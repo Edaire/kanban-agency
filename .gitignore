@@ -25,3 +25,4 @@ codex-web/
 # Keep templates/examples tracked.
 !templates/**
 !examples/**
+templates/.DS_Store

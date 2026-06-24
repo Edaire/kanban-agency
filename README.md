@@ -232,7 +232,7 @@ Later roles are visible up front as `todo`; they become `ready` when upstream ro
 
 ## Browser Cockpit
 
-Start the local gateway:
+Start the local gateway for workstation-only use:
 
 ```bash
 scripts/kanban-agency codex-web-gateway --port 8766
@@ -255,6 +255,35 @@ Useful routes:
 /resume/<task_id>           resume/rebuild stopped session
 /tmux-scroll/<task_id>      tmux copy-mode scroll endpoint used by ttyd wheel handler
 ```
+
+## Remote control
+
+Remote control extends the same `codex-web-gateway`; it does not introduce a second task database or a business Relay. The gateway remains responsible for authentication, authorization, CSRF checks, write leases, session lookup, and ttyd backend selection.
+
+Start remote mode with an auth file:
+
+```bash
+scripts/kanban-agency codex-web-gateway \
+  --remote \
+  --host 127.0.0.1 \
+  --port <gateway_port> \
+  --auth-file <remote-auth.json>
+```
+
+Remote auth files define separate readonly and writable login codes plus the browser-facing hosts and origins:
+
+```json
+{
+  "readonly_secret": "<readonly secret>",
+  "writable_secret": "<writable secret>",
+  "allowed_hosts": ["remote.example.com"],
+  "allowed_origins": ["https://remote.example.com"]
+}
+```
+
+Writable routes require writable login and CSRF. Remote ttyd access goes through `/ttyd/<task_id>` so the gateway can select readonly or writable backends, enforce write leases, and keep raw ttyd credentials private. Mobile users can open `/mobile`; when the embedded terminal cannot accept soft-keyboard input reliably, the mobile input bar posts to `/mobile-input/<task_id>`, which validates writable auth, CSRF, allowed origin, and the write lease before sending text plus Enter to the recorded tmux session.
+
+Remote mode has no built-in HTTPS/TLS termination. Put it behind SSH tunneling, VPN/private networking, or a TLS reverse proxy. For ECS, reverse proxy, and relay topologies, see [docs/remote-control-deployment.md](docs/remote-control-deployment.md).
 
 ## Codex and Claude Code integration
 
@@ -316,7 +345,7 @@ PYTHONPATH=/path/to/hermes-agent python -m pytest tests -q
 Current local verification:
 
 ```text
-49 passed
+222 passed
 ```
 
 ## Security / open-source checklist

@@ -29,7 +29,8 @@
     if(inFlight){ pending+=delta; if(!raf) raf=requestAnimationFrame(flush); return; }
     inFlight=true;
     try{
-      fetch('http://127.0.0.1:8766/tmux-scroll/'+encodeURIComponent(task)+'?delta='+encodeURIComponent(Math.round(delta)), {mode:'no-cors', cache:'no-store'})
+      var base=(location.pathname.indexOf('/ttyd/')===0||!document.referrer)?location.origin:(new URL(document.referrer)).origin;
+      fetch(base+'/tmux-scroll/'+encodeURIComponent(task)+'?delta='+encodeURIComponent(Math.round(delta)), {cache:'no-store'})
         .catch(function(){})
         .finally(function(){ inFlight=false; if(pending && !raf) raf=requestAnimationFrame(flush); });
     }catch(_e){ inFlight=false; }

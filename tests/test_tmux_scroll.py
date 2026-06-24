@@ -18,7 +18,10 @@ def test_ttyd_wheel_index_uses_tmux_scroll_endpoint_not_xterm_viewport():
     html = (core.TTYD_WHEEL_INDEX).read_text(errors='replace')
     injected = html.split('<script id="kanban-wheel-scroll-only">', 1)[1]
     assert '/tmux-scroll/' in injected
-    assert 'mode:\'no-cors\'' in injected or 'mode:"no-cors"' in injected
+    assert '127.0.0.1:8766/tmux-scroll' not in injected
+    assert "no-cors" not in injected
+    assert 'document.referrer' in injected
+    assert "location.pathname.indexOf('/ttyd/')" in injected
     assert 'vp.scrollTop += e.deltaY' not in injected
     assert 'stopImmediatePropagation' in injected
 
@@ -57,6 +60,27 @@ def test_tmux_scroll_down_at_live_bottom_is_noop(monkeypatch):
     assert out['steps'] == 0
     assert out['at_bottom'] is True
     assert calls == []
+
+
+def test_tmux_input_task_pastes_text_and_enter(monkeypatch, tmp_path):
+    core = load_core()
+    loaded = []
+    calls = []
+    monkeypatch.setattr(core, '_read_json_file', lambda path: {'tmux_name': 'kanban-codex-t1'})
+    monkeypatch.setattr(core, '_tmux_has_session', lambda name: True)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ['tmux', 'load-buffer']:
+            loaded.append(Path(cmd[-1]).read_text(encoding='utf-8'))
+        return type('R', (), {'returncode': 0})()
+
+    monkeypatch.setattr(core.subprocess, 'run', fake_run)
+    out = core.tmux_input_task('t1', text='hello mobile', enter=True)
+    assert out['ok'] is True
+    assert loaded == ['hello mobile']
+    assert any(cmd[:4] == ['tmux', 'paste-buffer', '-r', '-t'] for cmd in calls)
+    assert ['tmux', 'send-keys', '-t', 'kanban-codex-t1', 'Enter'] in calls
 
 
 def test_gateway_has_tmux_scroll_route():

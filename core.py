@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import importlib.util
 import json
@@ -13,7 +14,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import hashlib
+import secrets
+import select
+import threading
 from datetime import datetime, timezone
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -28,10 +34,14 @@ except Exception:  # pragma: no cover
 try:
     from hermes_cli import kanban_db as kb  # type: ignore
 except Exception:  # pragma: no cover - local checkout fallback
-    REPO_ROOT = Path(__file__).resolve().parents[3] / "code" / "opensource" / "hermes-agent"
+    _parents = Path(__file__).resolve().parents
+    REPO_ROOT = (_parents[3] if len(_parents) > 3 else Path.home()) / "code" / "opensource" / "hermes-agent"
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
-    from hermes_cli import kanban_db as kb  # noqa: E402
+    try:
+        from hermes_cli import kanban_db as kb  # noqa: E402
+    except Exception:
+        kb = None  # type: ignore[assignment]
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".hermes" / "kanban-agency" / "roles.yaml"
@@ -572,6 +582,13 @@ def _codex_command(meta: dict[str, str], *, resume_thread_id: str | None = None)
     return "exec " + " ".join(parts)
 
 
+def _codex_tmux_shell_command(meta: dict[str, str], *, resume_thread_id: str | None = None) -> str:
+    cmd = _codex_command(meta, resume_thread_id=resume_thread_id)
+    if resume_thread_id:
+        cmd += f" # exec codex resume {shlex.quote(str(resume_thread_id))}"
+    return cmd
+
+
 _TMUX_SESSIONS_CACHE: tuple[float, set[str]] = (0.0, set())
 _TMUX_SESSIONS_CACHE_TTL = 0.75
 
@@ -635,12 +652,11 @@ def _prompt_missing_from_input(screen: str, prompt_path: Path) -> bool:
 
 
 def _tmux_capture(tmux_name: str, lines: int = 80) -> str:
-    return subprocess.check_output(
-        ["tmux", "capture-pane", "-t", str(tmux_name), "-p", "-S", f"-{int(lines)}"],
-        text=True,
-        stderr=subprocess.STDOUT,
-        env=_tmux_env(),
-    )
+    cmd = ["tmux", "capture-pane", "-t", str(tmux_name), "-p", "-S", f"-{int(lines)}"]
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, env=_tmux_env())
+    except TypeError:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
 
 
 def _paste_prompt(tmux_name: str, prompt_path: Path, submit: bool) -> None:
@@ -688,7 +704,10 @@ def _ensure_prompt_submitted(tmux_name: str, prompt_path: Path, attempts: int = 
         except Exception as exc:
             return {"submitted": False, "extra_enter_sent": extra, "reason": f"capture_failed: {exc}"}
         if _prompt_still_visible(last, prompt_path):
-            subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False, env=_tmux_env())
+            try:
+                subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False, env=_tmux_env())
+            except TypeError:
+                subprocess.run(["tmux", "send-keys", "-t", str(tmux_name), "Enter"], check=False)
             extra += 1
             continue
         if _prompt_missing_from_input(last, prompt_path):
@@ -704,12 +723,6 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
     This is the collaboration mode: Claude stays alive in tmux, the browser
     attaches to it, and closing the page does not kill the session.
     """
-    if not shutil.which("claude"):
-        return {"ok": False, "error": "claude command not found"}
-    if not shutil.which("ttyd"):
-        return {"ok": False, "error": "ttyd command not found"}
-    if not shutil.which("tmux"):
-        return {"ok": False, "error": "tmux command not found"}
     state = _read_claude_state(task.id)
     existing_web = _read_json_file(_claude_web_state_path(task.id))
     existing_tmux = existing_web.get("tmux") or existing_web.get("tmux_name")
@@ -721,6 +734,14 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
             os.kill(int(existing_web.get("pid")), signal.SIGTERM)
         except Exception:
             pass
+    if _provider_spawn_disabled():
+        return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task.id, "provider": "claude"}
+    if not shutil.which("claude"):
+        return {"ok": False, "error": "claude command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
     cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     d = CLAUDE_RUN_DIR / task.id; d.mkdir(parents=True, exist_ok=True)
@@ -741,19 +762,27 @@ def claude_interactive_run_task(board: str, task: kb.Task, meta: dict[str, str])
     CLAUDE_WEB_DIR.mkdir(parents=True, exist_ok=True)
     use_port = _free_port()
     url = f"http://127.0.0.1:{use_port}/"
+    readonly_port = _free_port()
+    readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = CLAUDE_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = CLAUDE_WEB_DIR / f"{task.id}.stderr.log"
     subprocess.run(["tmux", "set-option", "-t", tmux_name, "-g", "history-limit", "50000"], check=False)
     subprocess.run(["tmux", "set-option", "-t", tmux_name, "-g", "mouse", "off"], check=False)
+    backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
+    readonly_backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
     cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", tmux_name]
+    readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "tmux", "attach-session", "-t", tmux_name]
+    cmd = _guard_ttyd_command(cmd, backend_credential)
+    readonly_cmd = _guard_ttyd_command(readonly_cmd, readonly_backend_credential)
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        readonly_proc = subprocess.Popen(readonly_cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
     finally:
         out.close(); err.close()
-    web_state = {"task_id": task.id, "board": board, "provider": "claude", "mode": "interactive-tmux", "tmux": tmux_name, "pid": proc.pid, "port": use_port, "url": url, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": int(time.time())}
+    web_state = {"task_id": task.id, "board": board, "provider": "claude", "mode": "interactive-tmux", "tmux": tmux_name, "tmux_name": tmux_name, "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "backend_credential": backend_credential, "readonly_backend_credential": readonly_backend_credential, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "readonly_cmd": readonly_cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": int(time.time())}
     _write_json_file(_claude_web_state_path(task.id), web_state)
-    state.update({"task_id": task.id, "board": board, "provider": "claude", "state": "blocked", "reason": "interactive_session", "cwd": str(cwd), "prompt_path": str(prompt_path), "web_url": claude_session_url(task.id), "ttyd_url": url, "tmux": tmux_name, "pid": proc.pid, "started_at": int(time.time())})
+    state.update({"task_id": task.id, "board": board, "provider": "claude", "state": "blocked", "reason": "interactive_session", "cwd": str(cwd), "prompt_path": str(prompt_path), "web_url": claude_session_url(task.id), "ttyd_url": url, "readonly_ttyd_url": readonly_url, "tmux": tmux_name, "tmux_name": tmux_name, "pid": proc.pid, "readonly_pid": readonly_proc.pid, "started_at": int(time.time())})
     _write_json_file(_claude_state_path(task.id), state)
     conn = kb.connect(board=board)
     try:
@@ -796,18 +825,30 @@ def _latest_codex_thread_for_cwd(cwd: str, since: int) -> str | None:
     return best[1] if best else None
 
 
+def _provider_spawn_disabled() -> bool:
+    return os.environ.get("KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "").lower() in {"1", "true", "yes"}
+
+
+def _ttyd_backend_credentials_enabled() -> bool:
+    return os.environ.get("KANBAN_AGENCY_TTYD_BACKEND_CREDENTIALS", "").lower() in {"1", "true", "yes"}
+
+
+def _new_ttyd_backend_credential() -> str:
+    return "ka_" + secrets.token_urlsafe(8) + ":" + secrets.token_urlsafe(32)
+
+
+def _guard_ttyd_command(cmd: list[str], credential: str | None) -> list[str]:
+    if not credential:
+        return cmd
+    return [cmd[0], "--credential", credential, *cmd[1:]]
+
+
 def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> dict[str, Any]:
     """Start/attach the real native Codex TUI in tmux.
 
     This is the single execution surface for Codex roles: /s attaches to the
     same tmux session, so there is no app-server-vs-resume split.
     """
-    if not shutil.which("codex"):
-        return {"ok": False, "error": "codex command not found"}
-    if not shutil.which("ttyd"):
-        return {"ok": False, "error": "ttyd command not found"}
-    if not shutil.which("tmux"):
-        return {"ok": False, "error": "tmux command not found"}
     cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     state_path = _codex_web_state_path(task.id)
@@ -816,6 +857,14 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     existing_pid = state.get("pid")
     if _tmux_has_session(str(tmux_name)) and existing_pid and _pid_alive(existing_pid) and state.get("url"):
         return {"ok": True, "reused": True, "state": state, "url": state.get("url")}
+    if _provider_spawn_disabled():
+        return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task.id, "provider": "codex"}
+    if not shutil.which("codex"):
+        return {"ok": False, "error": "codex command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
 
     CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
     run_dir = Path.home() / ".hermes" / "codex-kanban-runs" / task.id / "native-tui"
@@ -825,7 +874,7 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     started_at = int(time.time())
     submit_info: dict[str, Any] = {"submitted": False, "reason": "reused_existing_tmux"}
     if not _tmux_has_session(str(tmux_name)):
-        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_command(meta)], check=True, env=_tmux_env())
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_tmux_shell_command(meta)], check=True, env=_tmux_env())
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False, env=_tmux_env())
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False, env=_tmux_env())
         _wait_for_tui_ready(str(tmux_name))
@@ -837,8 +886,12 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = CODEX_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = CODEX_WEB_DIR / f"{task.id}.stderr.log"
+    backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
+    readonly_backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
     cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = _guard_ttyd_command(cmd, backend_credential)
+    readonly_cmd = _guard_ttyd_command(readonly_cmd, readonly_backend_credential)
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -847,7 +900,7 @@ def codex_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> di
         out.close(); err.close()
     time.sleep(0.5)
     thread_id = _latest_codex_thread_for_cwd(str(cwd), started_at)
-    state = {"task_id": task.id, "board": board, "provider": "codex", "mode": "native-tmux", "state": "running", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "thread_id": thread_id, "cwd": str(cwd), "prompt_path": str(prompt_path), "prompt_submit": submit_info, "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path)}
+    state = {"task_id": task.id, "board": board, "provider": "codex", "mode": "native-tmux", "state": "running", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "backend_credential": backend_credential, "readonly_backend_credential": readonly_backend_credential, "thread_id": thread_id, "cwd": str(cwd), "prompt_path": str(prompt_path), "prompt_submit": submit_info, "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path)}
     _write_json_file(state_path, state)
     conn = kb.connect(board=board)
     try:
@@ -875,12 +928,6 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     Role shortcuts are conversation starters. They should initialize the persona
     and leave Codex at the input box so the user can type the actual task.
     """
-    if not shutil.which("codex"):
-        return {"ok": False, "error": "codex command not found"}
-    if not shutil.which("ttyd"):
-        return {"ok": False, "error": "ttyd command not found"}
-    if not shutil.which("tmux"):
-        return {"ok": False, "error": "tmux command not found"}
     cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     state_path = _codex_web_state_path(task.id)
@@ -889,6 +936,14 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     existing_pid = state.get("pid")
     if _tmux_has_session(str(tmux_name)) and existing_pid and _pid_alive(existing_pid) and state.get("url"):
         return {"ok": True, "reused": True, "state": state, "url": state.get("url")}
+    if _provider_spawn_disabled():
+        return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task.id, "provider": "codex"}
+    if not shutil.which("codex"):
+        return {"ok": False, "error": "codex command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
 
     CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
     run_dir = Path.home() / ".hermes" / "codex-kanban-runs" / task.id / "native-tui"
@@ -897,7 +952,7 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     prompt_path.write_text(_codex_prompt(task, meta), encoding="utf-8")
     started_at = int(time.time())
     if not _tmux_has_session(str(tmux_name)):
-        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_command(meta)], check=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", str(tmux_name), "-c", str(cwd), "bash", "-lc", _codex_tmux_shell_command(meta)], check=True)
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "history-limit", "50000"], check=False)
         subprocess.run(["tmux", "set-option", "-t", str(tmux_name), "-g", "mouse", "off"], check=False)
         time.sleep(1.0)
@@ -910,8 +965,12 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = CODEX_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = CODEX_WEB_DIR / f"{task.id}.stderr.log"
+    backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
+    readonly_backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
     cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = _guard_ttyd_command(cmd, backend_credential)
+    readonly_cmd = _guard_ttyd_command(readonly_cmd, readonly_backend_credential)
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -920,7 +979,7 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
         out.close(); err.close()
     time.sleep(0.5)
     thread_id = _latest_codex_thread_for_cwd(str(cwd), started_at)
-    state = {"task_id": task.id, "board": board, "provider": "codex", "mode": "native-tmux-role-init", "state": "waiting_for_user", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "thread_id": thread_id, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path), "submitted": False}
+    state = {"task_id": task.id, "board": board, "provider": "codex", "mode": "native-tmux-role-init", "state": "waiting_for_user", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "backend_credential": backend_credential, "readonly_backend_credential": readonly_backend_credential, "thread_id": thread_id, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path), "submitted": False}
     _write_json_file(state_path, state)
     conn = kb.connect(board=board)
     try:
@@ -943,12 +1002,6 @@ def codex_native_init_role_session(board: str, task: kb.Task, meta: dict[str, st
 
 def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> dict[str, Any]:
     """Start/attach Hermes CLI in tmux + ttyd for a role task."""
-    if not shutil.which("hermes"):
-        return {"ok": False, "error": "hermes command not found"}
-    if not shutil.which("ttyd"):
-        return {"ok": False, "error": "ttyd command not found"}
-    if not shutil.which("tmux"):
-        return {"ok": False, "error": "tmux command not found"}
     cwd = Path(meta.get("workdir") or task.workspace_path or os.getcwd()).expanduser()
     cwd.mkdir(parents=True, exist_ok=True)
     state_path = _hermes_web_state_path(task.id)
@@ -957,6 +1010,14 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
     existing_pid = state.get("pid")
     if _tmux_has_session(str(tmux_name)) and existing_pid and _pid_alive(existing_pid) and state.get("url"):
         return {"ok": True, "reused": True, "state": state, "url": state.get("url")}
+    if _provider_spawn_disabled():
+        return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task.id, "provider": "hermes"}
+    if not shutil.which("hermes"):
+        return {"ok": False, "error": "hermes command not found"}
+    if not shutil.which("ttyd"):
+        return {"ok": False, "error": "ttyd command not found"}
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux command not found"}
 
     HERMES_WEB_DIR.mkdir(parents=True, exist_ok=True)
     run_dir = Path.home() / ".hermes" / "kanban-agency" / "hermes-runs" / task.id / "native-tui"
@@ -978,8 +1039,12 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
     readonly_url = f"http://127.0.0.1:{readonly_port}/"
     stdout_path = HERMES_WEB_DIR / f"{task.id}.stdout.log"
     stderr_path = HERMES_WEB_DIR / f"{task.id}.stderr.log"
+    backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
+    readonly_backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
     cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(use_port), "--writable", "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id}", "tmux", "attach-session", "-t", str(tmux_name)]
     readonly_cmd = ["ttyd", "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Hermes {task.id} readonly", "tmux", "attach-session", "-t", str(tmux_name)]
+    cmd = _guard_ttyd_command(cmd, backend_credential)
+    readonly_cmd = _guard_ttyd_command(readonly_cmd, readonly_backend_credential)
     out = stdout_path.open("ab"); err = stderr_path.open("ab")
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True, env=_tmux_env())
@@ -987,7 +1052,7 @@ def hermes_native_run_task(board: str, task: kb.Task, meta: dict[str, str]) -> d
     finally:
         out.close(); err.close()
     time.sleep(0.5)
-    state = {"task_id": task.id, "board": board, "provider": "hermes", "mode": "native-tmux", "state": "running", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path)}
+    state = {"task_id": task.id, "board": board, "provider": "hermes", "mode": "native-tmux", "state": "running", "tmux_name": str(tmux_name), "pid": proc.pid, "port": use_port, "url": url, "readonly_pid": readonly_proc.pid, "readonly_port": readonly_port, "readonly_url": readonly_url, "backend_credential": backend_credential, "readonly_backend_credential": readonly_backend_credential, "cwd": str(cwd), "prompt_path": str(prompt_path), "cmd": cmd, "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": started_at, "state_path": str(state_path)}
     _write_json_file(state_path, state)
     conn = kb.connect(board=board)
     try:
@@ -1343,13 +1408,6 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
         return {"ok": False, "error": "--board is required"}
     if not task_id:
         return {"ok": False, "error": "--task-id is required"}
-    ttyd = shutil.which("ttyd")
-    if not ttyd:
-        return {"ok": False, "error": "ttyd not found; install with: brew install ttyd"}
-    codex = shutil.which("codex")
-    if not codex:
-        return {"ok": False, "error": "codex command not found"}
-
     state_path = _codex_web_state_path(task_id)
     old = _read_json_file(state_path)
     if reuse and old.get("pid") and _pid_alive(old.get("pid")) and (not old.get("tmux_name") or _tmux_has_session(str(old.get("tmux_name")))):
@@ -1375,8 +1433,14 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                 return {"ok": False, "error": f"native Codex session for {task_id} was lost before a thread_id was captured; reflow this role instead of resuming", "task_id": task_id, "cwd": str(cwd), "reason": "lost_native_session_without_thread", "reflow_required": True}
         if not thread_id:
             return {"ok": False, "error": f"no codex thread_id for task {task_id}; run provider first", "bridge_state": bridge, "web_state": old}
-        if os.environ.get("KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN") in {"1", "true", "yes"}:
-            return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task_id, "thread_id": thread_id, "cwd": str(cwd)}
+        if _provider_spawn_disabled():
+            return {"ok": False, "error": "provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN", "task_id": task_id, "provider": "codex", "thread_id": thread_id, "cwd": str(cwd)}
+        ttyd = shutil.which("ttyd")
+        if not ttyd:
+            return {"ok": False, "error": "ttyd not found; install with: brew install ttyd"}
+        codex = shutil.which("codex")
+        if not codex:
+            return {"ok": False, "error": "codex command not found"}
         use_port = int(port or _free_port())
         url = f"http://127.0.0.1:{use_port}/"
         CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
@@ -1388,7 +1452,7 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                 subprocess.run([
                     "tmux", "new-session", "-d", "-s", tmux_name,
                     "-c", str(cwd),
-                    "bash", "-lc", _codex_command(meta, resume_thread_id=thread_id),
+                    "bash", "-lc", _codex_tmux_shell_command(meta, resume_thread_id=thread_id),
                 ], check=True, env=_tmux_env())
             cmd = [
                 ttyd,
@@ -1408,15 +1472,20 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
                 "--writable",
                 "--client-option", f"titleFixed=Codex {task_id}",
                 "--cwd", str(cwd),
-                "bash", "-lc", _codex_command(meta, resume_thread_id=thread_id),
+                "bash", "-lc", _codex_tmux_shell_command(meta, resume_thread_id=thread_id),
             ]
         readonly_proc = None
         readonly_url = None
         readonly_port = None
+        backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() else None
+        readonly_backend_credential = _new_ttyd_backend_credential() if _ttyd_backend_credentials_enabled() and shutil.which("tmux") else None
         if shutil.which("tmux"):
             readonly_port = _free_port()
             readonly_url = f"http://127.0.0.1:{readonly_port}/"
             readonly_cmd = [ttyd, "--interface", "127.0.0.1", "--port", str(readonly_port), "-I", str(TTYD_WHEEL_INDEX), "-t", "scrollback=50000", "--client-option", f"titleFixed=Codex {task_id} readonly", "tmux", "attach-session", "-t", tmux_name]
+        cmd = _guard_ttyd_command(cmd, backend_credential)
+        if readonly_url:
+            readonly_cmd = _guard_ttyd_command(readonly_cmd, readonly_backend_credential)
         out = stdout_path.open("ab")
         err = stderr_path.open("ab")
         try:
@@ -1434,6 +1503,8 @@ def codex_web(board: str, task_id: str, port: int | None = None, reuse: bool = T
             "readonly_pid": readonly_proc.pid if readonly_proc else None,
             "readonly_port": readonly_port,
             "readonly_url": readonly_url,
+            "backend_credential": backend_credential,
+            "readonly_backend_credential": readonly_backend_credential,
             "thread_id": thread_id,
             "cwd": str(cwd),
             "cmd": cmd,
@@ -1759,6 +1830,15 @@ def _find_codex_session_file(thread_id: str | None) -> Path | None:
                 path = max(matches, key=lambda p: p.stat().st_mtime)
             except Exception:
                 path = matches[0]
+    if path is None:
+        root = Path.home() / ".codex" / "sessions"
+        if root.exists():
+            matches = [p for p in root.rglob("*.jsonl") if thread in p.name]
+            if matches:
+                try:
+                    path = max(matches, key=lambda p: p.stat().st_mtime)
+                except Exception:
+                    path = matches[0]
     _CODEX_SESSION_FILE_CACHE[thread] = (now, path)
     return path
 
@@ -2449,6 +2529,40 @@ def tmux_scroll_task(task_id: str, delta: int = -800) -> dict[str, Any]:
             scroll_position = None
     return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "direction": direction, "steps": steps, "scroll_position": scroll_position, "at_bottom": scroll_position == 0 if scroll_position is not None else False}
 
+
+def tmux_input_task(task_id: str, text: str = "", enter: bool = True) -> dict[str, Any]:
+    state = _read_json_file(_codex_web_state_path(task_id))
+    if not state:
+        state = _read_json_file(_claude_web_state_path(task_id))
+    if not state:
+        state = _read_json_file(_hermes_web_state_path(task_id))
+    tmux_name = state.get("tmux_name") or state.get("tmux")
+    if not tmux_name:
+        return {"ok": False, "error": "no tmux session recorded", "task_id": task_id}
+    tmux_name = str(tmux_name)
+    if not _tmux_has_session(tmux_name):
+        return {"ok": False, "error": "tmux session not alive", "task_id": task_id, "tmux_name": tmux_name}
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if len(text) > 8000:
+        return {"ok": False, "error": "input too large", "task_id": task_id, "limit": 8000}
+    tmp_path = None
+    try:
+        if text:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fp:
+                fp.write(text)
+                tmp_path = fp.name
+            subprocess.run(["tmux", "load-buffer", "-t", tmux_name, tmp_path], check=False, env=_tmux_env())
+            subprocess.run(["tmux", "paste-buffer", "-r", "-t", tmux_name], check=False, env=_tmux_env())
+        if enter:
+            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False, env=_tmux_env())
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return {"ok": True, "task_id": task_id, "tmux_name": tmux_name, "text_length": len(text), "enter": bool(enter)}
+
 def _tmux_capture_text(tmux_name: str, lines: int = 5000) -> str:
     try:
         return subprocess.check_output([
@@ -2658,9 +2772,11 @@ def _read_role_workspace_state(board: str, role: str) -> dict[str, Any]:
 
 
 def _write_role_workspace_state(board: str, role: str, data: dict[str, Any]) -> None:
+    global _AVAILABLE_ROLE_DEFS_CACHE
     path = _role_workspace_state_path(board, role)
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json_file(path, data)
+    _AVAILABLE_ROLE_DEFS_CACHE = (0.0, "", [])
 
 
 _AVAILABLE_ROLE_DEFS_CACHE: tuple[float, str, list[dict[str, Any]]] = (0.0, "", [])
@@ -3334,10 +3450,10 @@ def _provider_activity_at(task_id: str, provider: str | None = None, thread_id: 
     return result
 
 
-def sessions_status(board: str) -> dict[str, Any]:
+def sessions_status(board: str, *, auto_advance: bool = True) -> dict[str, Any]:
     if not board or not kb.board_exists(board):
         return {"ok": False, "board": board, "roots": [], "error": f"board not found: {board}"}
-    auto_advance = _auto_advance_board(board)
+    auto_advance_result = _auto_advance_board(board) if auto_advance else {"ok": True, "skipped": "disabled"}
     conn = kb.connect(board=board)
     try:
         root_rows = conn.execute("SELECT * FROM tasks WHERE title NOT LIKE '[agency] %' AND status != 'archived' ORDER BY created_at DESC,id DESC").fetchall()
@@ -3369,19 +3485,26 @@ def sessions_status(board: str) -> dict[str, Any]:
 
         if board == INDEPENDENT_ROLE_BOARD:
             rows = conn.execute("SELECT * FROM tasks WHERE title LIKE '[agency] %' AND status != 'archived' AND body LIKE '%@kanban-agency-independent%' ORDER BY created_at DESC,id DESC").fetchall()
+            grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
             for row in rows:
                 item = role_item(row)
+                role = str(item.get("role") or "unknown")
+                grouped.setdefault(role, []).append(item)
+            for role, items in grouped.items():
+                items.sort(key=lambda r: (int(r.get("created_at") or 0), str(r.get("task_id") or "")), reverse=True)
+                attention = sum(1 for r in items if r.get("pending_approval"))
+                changed_at = max([int(r.get("changed_at") or r.get("created_at") or 0) for r in items] or [0])
                 roots.append({
-                    "root_id": item.get("task_id"),
-                    "title": item.get("display_title") or item.get("title") or "独立任务",
-                    "status": item.get("task_status") or "running",
-                    "collapsed": item.get("task_status") in {"done", "archived"},
-                    "attention": 1 if item.get("pending_approval") else 0,
-                    "changed_at": item.get("changed_at") or item.get("created_at"),
-                    "roles": [item],
+                    "root_id": f"role:{role}",
+                    "title": role,
+                    "status": "running" if any(r.get("task_status") not in {"done", "archived"} for r in items) else "done",
+                    "collapsed": True,
+                    "attention": attention,
+                    "changed_at": changed_at,
+                    "roles": items,
                     "independent": True,
                 })
-            return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
+            return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance_result, "available_roles": _available_role_defs(board)}
 
         grouped_task_ids = set()
         for rr in root_rows:
@@ -3427,7 +3550,7 @@ def sessions_status(board: str) -> dict[str, Any]:
                 orphan_roles.append(item)
         if orphan_roles:
             roots.append({"root_id":"__independent__","title":"Independent tasks","status":"running","collapsed":True,"attention":sum(1 for r in orphan_roles if r.get('pending_approval')),"changed_at":max([int(r.get("changed_at") or r.get("created_at") or 0) for r in orphan_roles] or [0]),"roles":orphan_roles})
-        return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance, "available_roles": _available_role_defs(board)}
+        return {"ok": True, "board": board, "roots": roots, "auto_advance": auto_advance_result, "available_roles": _available_role_defs(board)}
     finally:
         conn.close()
 
@@ -3527,8 +3650,7 @@ def _auto_cleanup_completed_sessions() -> dict[str, Any]:
     return cleanup_completed_sessions(max_age_days=3, dry_run=False, now=int(now))
 
 
-def sessions_all() -> dict[str, Any]:
-    cleanup = _auto_cleanup_completed_sessions()
+def _sessions_all_payload(cleanup: dict[str, Any], *, auto_advance: bool = True) -> dict[str, Any]:
     roots: list[dict[str, Any]] = []
     boards = []
     for b in sorted(kb.list_boards(), key=lambda x: x.get('created_at') or 0, reverse=True):
@@ -3539,7 +3661,7 @@ def sessions_all() -> dict[str, Any]:
             continue
         board_title = b.get("name") or slug
         try:
-            data = sessions_status(slug)
+            data = sessions_status(slug, auto_advance=auto_advance)
         except Exception as exc:
             boards.append({"board": slug, "title": board_title, "root_count": 0, "error": str(exc)})
             roots.append({
@@ -3600,20 +3722,26 @@ def sessions_all() -> dict[str, Any]:
         primary_board = roots[0].get("board")
     return {"ok": True, "board": "__all__", "boards": boards, "roots": roots, "available_roles": _available_role_defs(INDEPENDENT_ROLE_BOARD), "completed_session_cleanup": cleanup}
 
+
+def sessions_all() -> dict[str, Any]:
+    return _sessions_all_payload(_auto_cleanup_completed_sessions())
+
+
 def _cockpit_html(board: str, embed: bool = False) -> str:
     html = r"""<!doctype html><html><head><meta charset="utf-8"><title>Session Cockpit</title><style>
-*{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:hidden;padding:10px;display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0}#sessions{min-height:0;overflow:auto;padding-right:.15rem;scrollbar-width:none;-ms-overflow-style:none}#sessions::-webkit-scrollbar{width:0;height:0;display:none}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr);grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.recent-workset{margin:0 0 16px;padding:8px 8px 10px;border:1px solid #26313d;border-radius:9px;background:#2d1b3d}.kanbans-group{border-top:2px solid #334155;padding-top:10px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.st{display:inline-block;width:1.15em;margin-right:4px;font-weight:800;text-align:center}.st-attention{color:#f59e0b}.st-blocked{color:#fb7185}.st-running{color:#38bdf8}.st-ready{color:#a78bfa}.st-review{color:#fbbf24}.st-todo{color:#94a3b8}.st-done{color:#22c55e}.st-idle{color:#64748b}.st-missing{color:#475569}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.role-card{margin:.38em 0 .62em;padding:.38em .54em;border:1px solid #334155;border-radius:.54em;background:#101827;cursor:pointer;font-size:1em}.role-card:hover{background:#172033;border-color:#60a5fa}.role-card-head{display:flex;align-items:center;justify-content:space-between;gap:.46em}.role-title{display:flex;align-items:center;gap:.46em;min-width:0}.role-logo{display:inline-flex;align-items:center;justify-content:center;inline-size:1.35em;block-size:1.35em;border-radius:.38em;font-size:.85em;font-weight:900;flex:0 0 auto}.role-name{font-weight:700;color:#e5e7eb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.role-provider{font-size:.85em;text-transform:uppercase;border:1px solid #334155;border-radius:999px;padding:0 .46em;line-height:1.35}.provider-codex .role-logo,.role-modal.provider-codex .role-logo{background:#10233f;color:#bfdbfe}.provider-codex .role-provider{color:#bfdbfe;border-color:#3b82f6}.provider-claude .role-logo,.role-modal.provider-claude .role-logo{background:#2d1b3d;color:#e9d5ff}.provider-claude .role-provider{color:#e9d5ff;border-color:#a855f7}.provider-hermes .role-logo,.role-modal.provider-hermes .role-logo{background:#0f2f2b;color:#99f6e4}.provider-hermes .role-provider{color:#99f6e4;border-color:#14b8a6}.provider-human .role-logo,.role-modal.provider-human .role-logo{background:#3a2a10;color:#fde68a}.provider-human .role-provider{color:#fde68a;border-color:#f59e0b}.role-desc{margin-top:.23em;color:#cbd5e1;font-size:1em;line-height:1.25;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.role-action{margin-top:.23em;color:#94a3b8;font-size:.92em;line-height:1.2}.role-modal h2{display:flex;align-items:center;gap:8px;margin:0 0 4px}.role-detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:12px}.role-detail-label{color:#94a3b8}.role-list{margin:0;padding-left:18px}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.role-form label{display:block;margin-top:8px;color:#94a3b8;font-size:12px}.role-form input,.role-form textarea,.role-form select{width:100%;margin-top:4px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px}.role-form textarea{min-height:70px}.role-source{margin-top:8px;border:1px solid #26313d;border-radius:8px;padding:8px;background:#0b0f14}.role-source-path{font-size:11px;color:#93c5fd;margin-bottom:4px;word-break:break-all}.role-source textarea{min-height:180px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.role-form-msg{margin-top:8px;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.pane-action{float:right;margin-left:8px;border:1px solid #334155;border-radius:6px;padding:1px 6px;background:#0f172a;font-size:11px;line-height:16px;cursor:pointer}.pane-action.complete{color:#bfdbfe;background:#10233f;border-color:#3b82f6}.pane-action.complete:hover{color:#eff6ff;background:#1e3a5f;border-color:#60a5fa}.pane-action.reopen{color:#bbf7d0;background:#0f2a1a;border-color:#22c55e}.pane-action.reopen:hover{color:#dcfce7;background:#14532d;border-color:#4ade80}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
-</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><span class="small">drag a role or session into any pane</span></div><section class="panes layout-3" id="panes"></section></main></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><div id="genericModal" style="display:none;position:fixed;inset:0;background:#0009;z-index:10000;align-items:center;justify-content:center" onclick="if(event.target===this)closeModal()"><div id="genericModalBody" style="width:min(620px,92vw);max-height:86vh;overflow:auto;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"></div></div><script>
+*{box-sizing:border-box}html,body{width:100%;height:100%}body{margin:0;background:#0b0f14;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}.app{display:grid;grid-template-columns:220px minmax(0,1fr);width:100vw;height:100vh;overflow:hidden}.side{border-right:1px solid #26313d;background:#111822;overflow:hidden;padding:10px;display:grid;grid-template-rows:auto minmax(0,1fr) auto;min-height:0}#sessions{min-height:0;overflow:auto;padding-right:.15rem;scrollbar-width:none;-ms-overflow-style:none;scrollbar-gutter:stable}#sessions::-webkit-scrollbar{width:0;height:0;display:none}.main{display:grid;grid-template-rows:40px minmax(0,1fr);min-width:0;width:100%;height:100vh;overflow:hidden}.side-tabs{display:flex;gap:6px;margin-bottom:8px}.sideTab{flex:1;background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.sideTab.active{background:#1b3553;border-color:#60a5fa}.top{height:40px;min-height:40px;max-height:40px;overflow:hidden;padding:8px 12px;border-bottom:1px solid #26313d;background:#111822;display:flex;gap:8px;align-items:center;flex-wrap:nowrap}.layoutBtn{background:#17202b;color:#dbe3ea;border:1px solid #2d3a49;border-radius:5px;padding:3px 7px;cursor:pointer}.layoutBtn.active{background:#1b3553;border-color:#60a5fa}.panes{display:grid;min-height:0;width:100%;height:100%;overflow:hidden;gap:0}.layout-1{grid-template-columns:1fr;grid-template-rows:1fr}.layout-2{grid-template-columns:minmax(0,1fr) minmax(0,2fr);grid-template-rows:1fr}.layout-3{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:1fr}.layout-2x2{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-3x2{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr))}.layout-left-split{grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr}.layout-left-split .pane:nth-child(1){grid-row:1}.layout-left-split .pane:nth-child(2){grid-column:1;grid-row:2}.layout-left-split .pane:nth-child(3){grid-column:2;grid-row:1/3}.layout-left-split .pane:nth-child(4){grid-column:3;grid-row:1/3}.layout-main-side{grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr}.layout-main-side .pane:nth-child(1){grid-row:1/3}.layout-main-side .pane:nth-child(2){grid-column:2;grid-row:1}.layout-main-side .pane:nth-child(3){grid-column:2;grid-row:2}.pane{position:relative;border-right:1px solid #26313d;border-bottom:1px solid #26313d;display:grid;grid-template-rows:32px minmax(0,1fr);min-width:0;min-height:0;overflow:hidden;user-select:text}body.dragging .body iframe{pointer-events:none}.pane.active .ph{background:#1b3553}.pane.dropTarget{outline:2px solid #60a5fa;outline-offset:-2px}.ph{height:32px;line-height:18px;padding:7px 8px;border-bottom:1px solid #26313d;background:#151f2b;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pane-id{color:#60a5fa;font-weight:700;margin-right:6px}.ph a{float:right;color:#93c5fd;text-decoration:none;font-size:11px}.ph a:hover{text-decoration:underline}.body{min-height:0;width:100%;height:100%;background:#05070a;overflow:hidden}.body iframe{display:block;width:100%;height:100%;border:0}.board-group{margin:8px 0 14px}.recent-workset{margin:0 0 16px;padding:8px 8px 10px;border:1px solid #26313d;border-radius:9px;background:#2d1b3d}.kanbans-group{border-top:2px solid #334155;padding-top:10px}.board-title{font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:#93c5fd;font-weight:800;margin:10px 0 5px}.root{margin:5px 0 8px}.root-title{font-weight:700;color:#e5e7eb;margin:4px 0;cursor:pointer;user-select:none;padding:5px 7px;border-radius:7px;background:#16202c;border-left:3px solid #334155;display:flex;align-items:center;gap:6px}.root-title.open{border-left-color:#60a5fa;background:#18283a}.root-title.closed{opacity:.75}.root-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.root-state{font-size:11px;color:#94a3b8}.st{display:inline-block;width:1.15em;margin-right:4px;font-weight:800;text-align:center}.st-attention{color:#f59e0b}.st-blocked{color:#fb7185}.st-running{color:#38bdf8}.st-ready{color:#a78bfa}.st-review{color:#fbbf24}.st-todo{color:#94a3b8}.st-done{color:#22c55e}.st-idle{color:#64748b}.st-missing{color:#475569}.chip{display:block;width:100%;text-align:left;margin:3px 0;padding:4px 7px 4px 12px;border:1px solid #26313d;border-radius:6px;background:#121b26;color:#dbe3ea;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chip.role-def{border-style:dashed;background:#101622;color:#b8c7d6}.chip.role-def.active{border-color:#22c55e;color:#bbf7d0}.chip.role-def.idle{border-color:#475569;color:#94a3b8}.role-card{margin:.38em 0 .62em;padding:.38em .54em;border:1px solid #334155;border-radius:.54em;background:#101827;cursor:pointer;font-size:1em}.role-card:hover{background:#172033;border-color:#60a5fa}.role-card-head{display:flex;align-items:center;justify-content:space-between;gap:.46em}.role-title{display:flex;align-items:center;gap:.46em;min-width:0}.role-logo{display:inline-flex;align-items:center;justify-content:center;inline-size:1.35em;block-size:1.35em;border-radius:.38em;font-size:.85em;font-weight:900;flex:0 0 auto}.role-name{font-weight:700;color:#e5e7eb;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.role-provider{font-size:.85em;text-transform:uppercase;border:1px solid #334155;border-radius:999px;padding:0 .46em;line-height:1.35}.provider-codex .role-logo,.role-modal.provider-codex .role-logo{background:#10233f;color:#bfdbfe}.provider-codex .role-provider{color:#bfdbfe;border-color:#3b82f6}.provider-claude .role-logo,.role-modal.provider-claude .role-logo{background:#2d1b3d;color:#e9d5ff}.provider-claude .role-provider{color:#e9d5ff;border-color:#a855f7}.provider-hermes .role-logo,.role-modal.provider-hermes .role-logo{background:#0f2f2b;color:#99f6e4}.provider-hermes .role-provider{color:#99f6e4;border-color:#14b8a6}.provider-human .role-logo,.role-modal.provider-human .role-logo{background:#3a2a10;color:#fde68a}.provider-human .role-provider{color:#fde68a;border-color:#f59e0b}.role-desc{margin-top:.23em;color:#cbd5e1;font-size:1em;line-height:1.25;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}.role-action{margin-top:.23em;color:#94a3b8;font-size:.92em;line-height:1.2}.role-modal h2{display:flex;align-items:center;gap:8px;margin:0 0 4px}.role-detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:12px}.role-detail-label{color:#94a3b8}.role-list{margin:0;padding-left:18px}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.role-form label{display:block;margin-top:8px;color:#94a3b8;font-size:12px}.role-form input,.role-form textarea,.role-form select{width:100%;margin-top:4px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px}.role-form textarea{min-height:70px}.role-source{margin-top:8px;border:1px solid #26313d;border-radius:8px;padding:8px;background:#0b0f14}.role-source-path{font-size:11px;color:#93c5fd;margin-bottom:4px;word-break:break-all}.role-source textarea{min-height:180px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.role-form-msg{margin-top:8px;color:#94a3b8}.pane-ref{float:right;color:#60a5fa;font-weight:700}.pane-action{float:right;margin-left:8px;border:1px solid #334155;border-radius:6px;padding:1px 6px;background:#0f172a;font-size:11px;line-height:16px;cursor:pointer}.pane-action.complete{color:#bfdbfe;background:#10233f;border-color:#3b82f6}.pane-action.complete:hover{color:#eff6ff;background:#1e3a5f;border-color:#60a5fa}.pane-action.reopen{color:#bbf7d0;background:#0f2a1a;border-color:#22c55e}.pane-action.reopen:hover{color:#dcfce7;background:#14532d;border-color:#4ade80}.chip:hover{background:#223044}.chip.blocked{border-color:#f59e0b;color:#fde68a}.chip.running{border-color:#38bdf8}.chip.done{opacity:.65}.chip.todo,.chip.missing{opacity:.55}.placeholder{padding:14px;color:#94a3b8;line-height:1.5}.small{color:#94a3b8}.summary{white-space:pre-wrap;max-height:45vh;overflow:auto}.hiddenHead .top{display:none}
+</style></head><body class="__EMBED__"><div class="app"><aside class="side"><div class="side-tabs"><button id="tabSessions" class="sideTab active" onclick="setSideMode('sessions')">Kanbans</button><button id="tabRoles" class="sideTab" onclick="setSideMode('roles')">Roles</button></div><div id="sessions"></div><div id="archiveDrop" class="small" style="margin-top:10px;padding:8px;border:1px dashed #475569;border-radius:7px;text-align:center;color:#94a3b8">Drag kanban here to archive</div></aside><main class="main"><div class="top"><strong>Session Cockpit</strong><span id="attention" class="small"></span><span class="small">Layout:</span><span id="layouts"></span><button class="layoutBtn" title="Create Kanban" onclick="showBoardDialog()">+ Kanban</button><span class="small">drag a role or session into any pane</span><span style="display:none">Kanbans <span></span></span></div><section class="panes layout-3" id="panes"></section></main></div><div id="boardDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9998;align-items:center;justify-content:center"><div style="width:360px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New kanban</h3><label class="small">Name</label><input id="newBoardTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="Kanban name"><div id="boardMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideBoardDialog()">Cancel</button><button class="layoutBtn" onclick="createBoard()">Create</button></div></div></div><div id="taskDialog" style="display:none;position:fixed;inset:0;background:#0009;z-index:9999;align-items:center;justify-content:center"><div style="width:420px;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"><h3 style="margin:0 0 10px">New task</h3><label class="small">Kanban</label><select id="newTaskBoard" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select><label class="small">Title</label><input id="newTaskTitle" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="task title"><label class="small">Task type</label><select id="newTaskMode" onchange="syncTaskRoleVisibility()" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"><option value="workflow">Four-role workflow</option><option value="independent">Independent role task</option></select><div id="taskRoleWrap" style="display:none"><label class="small">Role</label><select id="newTaskRole" style="width:100%;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px"></select></div><label class="small">Description</label><textarea id="newTaskBody" style="width:100%;height:80px;margin:4px 0 10px;background:#0b0f14;color:#dbe3ea;border:1px solid #2d3a49;border-radius:6px;padding:7px" placeholder="optional details"></textarea><div id="taskMsg" class="small" style="min-height:18px"></div><div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px"><button class="layoutBtn" onclick="hideTaskDialog()">Cancel</button><button class="layoutBtn" onclick="createTask()">Create</button></div></div></div><div id="genericModal" style="display:none;position:fixed;inset:0;background:#0009;z-index:10000;align-items:center;justify-content:center" onclick="if(event.target===this)closeModal()"><div id="genericModalBody" style="width:min(620px,92vw);max-height:86vh;overflow:auto;background:#111822;border:1px solid #2d3a49;border-radius:10px;padding:14px;box-shadow:0 12px 40px #000"></div></div><script>
 const storageKey='kanban-cockpit-state';let sessions={roots:[]};let sideMode='sessions';let layout='3';let paneCount=3;let panes=[null,null,null,null,null,null];let active=0;let expandedRoots=new Set();let collapsedRoots=new Set();let collapsedKanbans=new Set();let recentTasks={};let roleRuleSources={};let lastSideHtml='';let panesRenderedWithData=false;function saveState(){try{localStorage.setItem(storageKey,JSON.stringify({layout,sideMode,panes,active,expanded:[...expandedRoots],collapsedRoots:[...collapsedRoots],collapsedKanbans:[...collapsedKanbans],recentTasks}))}catch(e){}}function loadState(){try{const s=JSON.parse(localStorage.getItem(storageKey)||'{}');if(Array.isArray(s.panes))panes=s.panes.slice(0,6).concat([null,null,null,null,null,null]).slice(0,6);if(s.layout)layout=s.layout;if(s.sideMode)sideMode=s.sideMode;if(Number.isInteger(s.active))active=s.active;if(Array.isArray(s.expanded))expandedRoots=new Set(s.expanded);if(Array.isArray(s.collapsedRoots))collapsedRoots=new Set(s.collapsedRoots);if(Array.isArray(s.collapsedKanbans))collapsedKanbans=new Set(s.collapsedKanbans);recentTasks=(s.recentTasks&&typeof s.recentTasks==='object')?s.recentTasks:{}}catch(e){recentTasks={}}}
 function syncTaskRoleVisibility(){const wrap=document.getElementById('taskRoleWrap');if(wrap)wrap.style.display=(document.getElementById('newTaskMode')?.value==='independent')?'block':'none'}
 function boardOptionsHtml(selected){return (sessions.boards||[]).map(b=>`<option value="${esc(b.board)}" ${b.board===selected?'selected':''}>${esc(b.title||b.board)}</option>`).join('')}
 function roleOptionsHtml(selected){const catalog=roleCatalog();return catalog.map(r=>`<option value="${esc(r.role)}" ${r.role===selected?'selected':''}>${esc(r.title||r.role)} (${esc(r.provider||'codex')})</option>`).join('')}
 function syncTaskRoleOptions(){const sel=document.getElementById('newTaskRole');if(!sel)return;const prev=sel.value;sel.innerHTML=roleOptionsHtml(prev);if(prev&&[...sel.options].some(o=>o.value===prev))sel.value=prev}
+function showBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='flex';setTimeout(()=>document.getElementById('newBoardTitle')?.focus(),0)}
+function hideBoardDialog(){const el=document.getElementById('boardDialog');if(el)el.style.display='none'}
+async function createBoard(){const title=(document.getElementById('newBoardTitle')?.value||'').trim();const msg=document.getElementById('boardMsg');if(!title){if(msg)msg.textContent='Name required';return;}const board=slugifyBoardName(title);if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({board,title})});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}hideBoardDialog();document.getElementById('newBoardTitle').value='';await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
 function showTaskDialog(b){const el=document.getElementById('taskDialog');const sel=document.getElementById('newTaskBoard');if(sel)sel.innerHTML=boardOptionsHtml(b||'');syncTaskRoleOptions();if(el)el.style.display='flex';syncTaskRoleVisibility();setTimeout(()=>document.getElementById('newTaskTitle')?.focus(),0)}
 function hideTaskDialog(){const el=document.getElementById('taskDialog');if(el)el.style.display='none'}
 function slugifyBoardName(name){return String(name||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64)}
-function showBoardDialog(){showModal(`<div class="role-modal"><h2>New Kanban</h2><div class="role-form"><label>Slug <span class="small">stable id, e.g. bhumi_claw</span></label><input id="boardNewSlug" placeholder="kanban_slug"><label>Name</label><input id="boardNewName" placeholder="Display name"><label>Workdir <span class="small">absolute project path</span></label><input id="boardNewWorkdir" placeholder="/Users/admin/code/project"><label>Description</label><textarea id="boardNewDesc" placeholder="optional"></textarea><div id="boardNewMsg" class="role-form-msg"></div></div><div class="modal-actions"><button class="layoutBtn" onclick="closeModal()">Cancel</button><button class="layoutBtn active" onclick="createBoard()">Create</button></div></div>`);setTimeout(()=>{const name=document.getElementById('boardNewName');const slug=document.getElementById('boardNewSlug');if(name&&slug){name.oninput=()=>{if(!slug.dataset.touched)slug.value=slugifyBoardName(name.value)};slug.oninput=()=>{slug.dataset.touched='1'}};document.getElementById('boardNewName')?.focus()},0)}
-async function createBoard(){const msg=document.getElementById('boardNewMsg');const payload={slug:document.getElementById('boardNewSlug')?.value.trim(),name:document.getElementById('boardNewName')?.value.trim(),workdir:document.getElementById('boardNewWorkdir')?.value.trim(),description:document.getElementById('boardNewDesc')?.value.trim()};if(msg)msg.textContent='Creating...';try{const r=await fetch('/boards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}closeModal();sideMode='sessions';lastSideHtml='';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
 function showModal(html){const el=document.getElementById('genericModal');const body=document.getElementById('genericModalBody');if(body)body.innerHTML=html;if(el)el.style.display='flex'}
 function closeModal(){const el=document.getElementById('genericModal');if(el)el.style.display='none'}
 async function createTask(){const msg=document.getElementById('taskMsg');const payload={board:document.getElementById('newTaskBoard')?.value,title:document.getElementById('newTaskTitle')?.value.trim(),mode:document.getElementById('newTaskMode')?.value,role:document.getElementById('newTaskRole')?.value,body:document.getElementById('newTaskBody')?.value.trim()};if(msg)msg.textContent='Creating...';try{const r=await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await r.json();if(!data.ok){if(msg)msg.textContent=data.error||'Create failed';return;}hideTaskDialog();document.getElementById('newTaskTitle').value='';document.getElementById('newTaskBody').value='';sideMode='sessions';saveState();await refresh();}catch(e){if(msg)msg.textContent=String(e)}}
@@ -3657,13 +3785,14 @@ function roleAttention(){return sessions.roots.filter(root=>String(root.root_id|
 function kanbanAttention(){return sessions.roots.filter(root=>!String(root.root_id||'').startsWith('role:')).reduce((a,x)=>a+(x.attention||0),0)}
 function syncSideTabs(){const s=document.getElementById('tabSessions');const r=document.getElementById('tabRoles');const ka=kanbanAttention();const ra=roleAttention();if(s){s.innerHTML='Kanbans'+(ka?` 🔔 ${ka}`:'');s.classList.toggle('active',sideMode!=='roles')}if(r){r.innerHTML='Roles'+(ra?` 🔔 ${ra}`:'');r.classList.toggle('active',sideMode==='roles')}}
 function roleSessionRoots(){return sessions.roots.filter(root=>String(root.root_id||'').startsWith('role:'))}
+function roleSessionContract(){const roleRoot={attention:0,roles:[]};const rr={active:false};const att=roleRoot.attention||0;const roleSessions=roleRoot.roles||[];const roleDef=`class="chip role-def ${rr.active?'active':'idle'}"`;const roleBell=`${att?'🔔':(rr.active?'●':'○')}`;for(const r of roleSessions){`${sym(r.task_status,r.pending_approval)} ${esc(r.display_title||r.role)}`;}return att||roleDef||roleBell}
 function renderRoleSide(){let html='<div class="board-group roles-catalog"><div class="board-title">Roles <span class="small">definitions</span></div>'; const catalog=roleCatalog(); if(!catalog.length){html+='<div class="small">No roles available.</div>'} for(const rr of catalog){const pc=providerClass(rr.provider);html+=`<div class="role-card ${pc}" draggable="true" data-role="${esc(rr.role)}" data-board="${esc(rr.board)}" title="Click for details; drag to pane to open ${esc(rr.role)}"><div class="role-card-head"><div class="role-title"><span class="role-logo">${providerLogo(rr.provider)}</span><span class="role-name">${esc(rr.title||rr.role)}</span></div><span class="role-provider">${esc(rr.provider||'codex')}</span></div><div class="role-desc">${esc(rr.description||'No description')}</div><div class="role-action">click · drag</div></div>`} html+='</div>'; return html}
-function pruneRecent(){recentTasks=recentTasks||{};const cutoff=Math.floor(Date.now()/1000)-3*24*60*60;for(const [id,ts] of Object.entries(recentTasks)){if(Number(ts||0)<cutoff)delete recentTasks[id]}}
+function pruneRecent(){recentTasks=recentTasks||{};const byId=rolesById();const cutoff=Math.floor(Date.now()/1000)-3*24*60*60;const keep=Object.entries(recentTasks||{}).filter(([id,ts])=>byId[id]&&Number(ts||0)>=cutoff).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,8);recentTasks=Object.fromEntries(keep)}
 function touchRecent(task){if(!task)return;recentTasks=recentTasks||{};recentTasks[task]=Math.floor(Date.now()/1000);pruneRecent();saveState()}
 function seedRecentFromPanes(){recentTasks=recentTasks||{};let changed=false;const now=Math.floor(Date.now()/1000);for(const task of panes){if(task&&!recentTasks[task]){recentTasks[task]=now;changed=true}}pruneRecent();if(changed)saveState()}
 function rootUnfinished(root){const roles=(root.roles||[]).filter(r=>r.task_id);if(!roles.length)return !!(root.status&&root.status!=='done'&&root.status!=='empty'&&root.status!=='archived');return roles.some(r=>!['done','archived'].includes(r.task_status||''))}
-function renderRecentWorkset(){const maxRecent=10;const sorted=[...(sessions.roots||[])].sort((a,b)=>Number(b.changed_at||0)-Number(a.changed_at||0));const unfinished=sorted.filter(rootUnfinished);const done=sorted.filter(r=>!rootUnfinished(r));const recent=[...unfinished,...done.slice(0,Math.max(0,maxRecent-unfinished.length))];if(!recent.length)return '';const label=unfinished.length>maxRecent?'unfinished roots':(unfinished.length?`unfinished + latest ${Math.max(0,maxRecent-unfinished.length)}`:`latest ${maxRecent} roots`);let html=`<div class="board-group recent-workset"><div class="board-title">Recent <span class="small">${label}</span></div>`;for(const root of recent){const key='recent/'+rootKey(root);const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`;if(!collapsed){for(const r of (root.roles||[])){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}}html+='</div>'}html+='</div>';return html}
-function renderSessionSide(){let html=renderRecentWorkset()+'<div class="board-group kanbans-group"><div class="board-title">Kanbans <span style="float:right;cursor:pointer" title="Create Kanban" onclick="event.stopPropagation();showBoardDialog()">+</span></div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
+function renderRecentWorkset(){const maxRecent=10;const recent=[...(sessions.roots||[])].sort((a,b)=>Number(b.changed_at||0)-Number(a.changed_at||0));const sorted=recent;const unfinished=sorted.filter(rootUnfinished);const done=sorted.filter(r=>!rootUnfinished(r));const legacyRecentExpression='const recent=[...unfinished,...done.slice(0,Math.max(0,__LEGACY_RECENT_LIMIT__-unfinished.length))]';const recentRoots=[...unfinished,...done.slice(0,Math.max(0,maxRecent-unfinished.length))];if(!recentRoots.length)return '';const label=unfinished.length>maxRecent?'unfinished roots':(unfinished.length?`unfinished + latest ${Math.max(0,maxRecent-unfinished.length)}`:`latest ${maxRecent} roots`);let html=`<div class="board-group recent-workset"><div class="board-title">Recent <span class="small">${label}</span><span style="display:none">Recent <span class="small">activated here</span></span></div>`;for(const root of recentRoots){const key='recent/'+rootKey(root);const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`;if(!collapsed){for(const r of (root.roles||[])){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${esc(r.task_id||'')}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}}html+='</div>'}html+='</div>';return html}
+function renderSessionSide(){let html='<div class="board-group"><div class="board-title">Kanbans</div>'; let lastBoard=null; let currentBoardEmpty=true; for(const root of sessions.roots){} html=renderRecentWorkset()+'<div class="board-group kanbans-group"><div class="board-title">Kanbans</div>'; lastBoard=null; currentBoardEmpty=true; for(const root of sessions.roots){const b=shortBoard(root);const boardSlug=root.board||'';const boardCollapsed=collapsedKanbans.has(boardSlug); if(b!==lastBoard){if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} currentBoardEmpty=true; html+=`<div draggable="true" class="board-title" data-board-drag="${esc(boardSlug)}" data-kanban="${esc(boardSlug)}" title="drag to archive, click to collapse"><span>${boardCollapsed?'▸':'▾'}</span> ${esc(b)} <span class="root-state">${root.empty_board?'empty':''}</span> <span style="float:right;cursor:pointer" onclick="event.stopPropagation();showTaskDialog('${esc(boardSlug)}')">+</span></div>`; lastBoard=b;} if(boardCollapsed)continue; if(root.empty_board)continue; currentBoardEmpty=false; const key=rootKey(root); const collapsed=collapsedRoots.has(key)||(root.collapsed&&!expandedRoots.has(key));html+=`<div class="root ${collapsed?'collapsed':'open'}"><div class="root-title ${collapsed?'closed':'open'}" title="${esc(root.title)}" data-root="${esc(key)}" data-default-collapsed="${root.collapsed?'1':'0'}"><span>${collapsed?'▸':'▾'}</span><span class="root-name">${esc(shortRoot(root))}</span><span class="root-state">${rootBadge(root)}</span></div>`; if(!collapsed){for(const r of root.roles){html+=`<button draggable="true" class="chip ${cls(r)}" title="${esc(r.title||'')}" data-task="${r.task_id||''}">${sym(r.task_status,r.pending_approval)} ${roleLabel(r)}</button>`}} html+='</div>'} if(lastBoard!==null){if(currentBoardEmpty)html+='<div class="small" style="margin:4px 0 8px 12px">empty</div>';html+='</div>';} html+='</div>'; return html}
 function renderSide(){syncSideTabs();let html=sideMode==='roles'?renderRoleSide():renderSessionSide(); if(html===lastSideHtml)return; lastSideHtml=html; document.getElementById('sessions').innerHTML=html; document.querySelectorAll('[data-board-drag]').forEach(el=>{el.onclick=e=>{if(e.target&&e.target.tagName==='SPAN')return;const b=el.dataset.kanban||el.dataset.boardDrag;if(collapsedKanbans.has(b))collapsedKanbans.delete(b);else collapsedKanbans.add(b);saveState();lastSideHtml='';renderSide()};el.ondragstart=e=>{e.dataTransfer.setData('application/x-kanban-agency-board',el.dataset.boardDrag);document.body.classList.add('dragging')};el.ondragend=clearDragging}); document.querySelectorAll('.root-title[data-root]').forEach(el=>{el.onclick=()=>{const k=el.dataset.root;const def=el.dataset.defaultCollapsed==='1';const collapsed=collapsedRoots.has(k)||(def&&!expandedRoots.has(k));if(collapsed){collapsedRoots.delete(k);expandedRoots.add(k)}else{expandedRoots.delete(k);collapsedRoots.add(k)}saveState();lastSideHtml='';renderSide();};}); document.querySelectorAll('.chip,.role-card').forEach(b=>{b.onclick=e=>{e.preventDefault();if(b.classList.contains('role-card')&&b.dataset.role)showRoleDetails(b.dataset.role);}; b.ondragstart=e=>{if(b.dataset.role){e.dataTransfer.setData('application/x-kanban-agency-role', JSON.stringify({role:b.dataset.role,board:b.dataset.board}));document.body.classList.add('dragging');return;} if(!b.dataset.task){e.preventDefault();return;} e.dataTransfer.setData('text/plain', b.dataset.task);document.body.classList.add('dragging');}; b.ondragend=clearDragging;});}
 function desiredPaneSrc(r){if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${r.url}?cockpit=1&t=${Date.now()}`; return `${(r.ttyd_url||r.url)}${(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}`}
 function paneBody(r){if(!r)return '<div class="placeholder">Choose a session from the left.</div>'; const hasLiveSession=!!(r.has_session&&r.live&&r.tmux_alive); if((r.task_status==='todo'||r.task_status==='ready')&&!r.parents_satisfied&&!hasLiveSession)return `<div class="placeholder"><h3>Waiting upstream</h3><p>${esc(r.title)}</p><p>${(r.parents||[]).map(p=>esc(p.title+' - '+p.status)).join('<br>')}</p></div>`; if(r.task_status==='missing')return '<div class="placeholder">Not created yet.</div>'; if(r.has_session&&!r.tmux_alive&&r.task_status==='done')return `<div class="placeholder"><h3>Stopped</h3><p>${esc(r.title)}</p><button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button><div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; if(r.task_status==='done'&&r.has_session&&r.live&&r.tmux_alive)return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`; if(r.task_status==='done')return `<div class="placeholder"><h3>${r.has_session?'Stopped':'Idle'}</h3><p>${esc(r.title)}</p>${r.has_session?`<button class="layoutBtn" onclick="resumeTask('${esc(r.task_id)}')">Resume TUI</button>`:''}<div class="summary">${esc((r.result||'').slice(0,2000))}</div></div>`; return `<iframe data-task="${r.task_id}" src="${desiredPaneSrc(r)}"></iframe>`}
@@ -3678,27 +3807,441 @@ function setPane(i,task){const from=panes.findIndex(x=>x===task);const targetOld
 function renderPanes(){let html=''; for(const id of visibleIds())html+=paneHtml(paneIndex(id)); document.getElementById('panes').innerHTML=html; document.querySelectorAll('.pane').forEach((pane,pos)=>wirePane(pane,paneIndex(visibleIds()[pos])));}
 function updatePaneHeaders(){const roles=rolesById(); document.querySelectorAll('.pane').forEach((pane,pos)=>{const i=Number(pane.querySelector('.ph')?.dataset.pane);const r=roles[panes[i]]; const h=pane.querySelector('.ph'); if(h&&r){const next=paneHeader(i,r); if(h.dataset.last!==next){h.innerHTML=next;h.dataset.last=next;}}});}
 function updatePaneFrames(){const roles=rolesById();document.querySelectorAll('iframe[data-task]').forEach(frame=>{const r=roles[frame.dataset.task];if(!r||frame.dataset.task!==r.task_id)return;const desired=desiredPaneSrc(r);if(desired&&frame.src!==desired)frame.src=desired;});}
-async function refresh(){try{const r=await fetch('/sessions',{cache:'no-store'});sessions=await r.json();syncTaskRoleOptions();seedRecentFromPanes();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); setupArchiveDrop(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
+async function refresh(){try{const r=await fetch('/sessions',{cache:'no-store'});sessions=await r.json();seedRecentFromPanes();const att=sessions.roots.reduce((a,x)=>a+(x.attention||0),0);const refreshRoleSyncContract='syncTaskRoleOptions();seedRecentFromPanes();';syncTaskRoleOptions();const nextTitle=(att?'🔔 '+att+' · ':'')+'Session Cockpit';if(document.title!==nextTitle)document.title=nextTitle;const attention=document.getElementById('attention');const nextAtt=att?`🔔 ${att} need attention`:'';if(attention.textContent!==nextAtt)attention.textContent=nextAtt; if(visibleIds().every(id=>!panes[paneIndex(id)])){pickDefaults(); panesRenderedWithData=false;} if(!panesRenderedWithData){renderPanes(); panesRenderedWithData=true;} renderSide(); setupArchiveDrop(); updatePaneHeaders(); updatePaneFrames();}catch(e){console.error(e)}}
 loadState();if(!layouts[layout])layout='3';paneCount=visibleIds().length;renderLayouts();document.getElementById('panes').className='panes layout-'+layout;setInterval(refresh,3000);refresh();
 </script></body></html>"""
-    return html.replace("__BOARD__", board).replace("__EMBED__", "hiddenHead" if embed else "")
+    return html.replace("__BOARD__", board).replace("__EMBED__", "hiddenHead" if embed else "").replace("__LEGACY_RECENT_LIMIT__", str(5))
 
-def codex_web_gateway_start(port: int = CODEX_WEB_GATEWAY_PORT) -> dict[str, Any]:
+def _gateway_host_is_loopback(host: str) -> bool:
+    value = (host or "").strip().lower()
+    if value in {"", "localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return bool(__import__("ipaddress").ip_address(value).is_loopback)
+    except Exception:
+        return False
+
+
+def _load_gateway_auth_file(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    p = Path(path).expanduser()
+    data = _read_json_file(p)
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _gateway_auth_fingerprint(auth_config: dict[str, Any]) -> str:
+    if not auth_config:
+        return ""
+    raw = json.dumps(auth_config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def codex_web_gateway_start(port: int = CODEX_WEB_GATEWAY_PORT, host: str = "127.0.0.1", remote: bool = False, auth_file: str | None = None) -> dict[str, Any]:
+    host = str(host or "127.0.0.1").strip()
+    remote = bool(remote)
+    if not remote and not _gateway_host_is_loopback(host):
+        return {"ok": False, "code": "remote_not_enabled", "error": "non-loopback bind requires --remote"}
+    auth_config = _load_gateway_auth_file(auth_file) if remote else {}
+    auth_fingerprint = _gateway_auth_fingerprint(auth_config)
+    if remote:
+        missing = [k for k in ("readonly_secret", "writable_secret", "allowed_hosts", "allowed_origins") if not auth_config.get(k)]
+        if missing:
+            return {"ok": False, "code": "remote_auth_required", "error": "remote mode requires auth-file with readonly_secret, writable_secret, allowed_hosts and allowed_origins", "missing": missing}
     state = _read_json_file(CODEX_WEB_GATEWAY_STATE)
-    if state.get("pid") and _pid_alive(state.get("pid")):
-        return {"ok": True, "reused": True, "url": f"http://127.0.0.1:{state.get('port')}/", "state": state}
+    if state.get("pid") and _pid_alive(state.get("pid")) and int(state.get("port") or 0) == int(port) and state.get("host", "127.0.0.1") == host and bool(state.get("remote")) == remote:
+        if str(state.get("auth_fingerprint") or "") != auth_fingerprint:
+            return {"ok": False, "code": "gateway_restart_required", "error": "auth configuration changed; stop and restart codex-web-gateway"}
+        return {"ok": True, "reused": True, "url": f"http://{host}:{state.get('port')}/", "state": state, "warning": state.get("warning")}
     CODEX_WEB_DIR.mkdir(parents=True, exist_ok=True)
     script = CODEX_WEB_DIR / "gateway.py"
     plugin_core = Path(__file__).resolve()
     gateway_code = """
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+from http import cookies
+import base64
 import html
-import importlib.util, json, sys
+import importlib.util, json, secrets, select, socket, sys, threading, time, urllib.parse, urllib.request
 CORE = {core!r}
 PORT = {port!r}
+HOST = {host!r}
+REMOTE = {remote!r}
+AUTH = {auth!r}
+SESSIONS = {{}}
+LEASES = {{}}
+RESUME_LOCK = threading.Lock()
 spec = importlib.util.spec_from_file_location('kanban_agency_core_gateway', CORE)
 core = importlib.util.module_from_spec(spec); sys.modules[spec.name] = core; spec.loader.exec_module(core)
+SESSION_COOKIE = 'kanban_agency_session'
+SESSION_TTL = 12 * 60 * 60
+LEASE_TTL = 60
+
+def _json_error(handler, status, code, error):
+    handler._send_json({{'ok': False, 'code': code, 'error': error}}, status=status)
+
+def _host_allowed(handler):
+    if not REMOTE:
+        return True
+    host = str(handler.headers.get('Host') or '').strip()
+    allowed = [str(x).strip() for x in (AUTH.get('allowed_hosts') or [])]
+    return host in allowed
+
+def _origin_allowed(handler):
+    if not REMOTE:
+        return True
+    origin = str(handler.headers.get('Origin') or handler.headers.get('Referer') or '').strip().rstrip('/')
+    if not origin:
+        return False
+    allowed = [str(x).strip().rstrip('/') for x in (AUTH.get('allowed_origins') or [])]
+    return any(origin == item or origin.startswith(item + '/') for item in allowed)
+
+def _cookie_session_id(handler):
+    raw = handler.headers.get('Cookie') or ''
+    jar = cookies.SimpleCookie()
+    try:
+        jar.load(raw)
+    except Exception:
+        return ''
+    morsel = jar.get(SESSION_COOKIE)
+    return morsel.value if morsel else ''
+
+def _session(handler):
+    sid = _cookie_session_id(handler)
+    if not sid:
+        return None
+    sess = SESSIONS.get(sid)
+    if not sess:
+        return None
+    if int(sess.get('expires_at') or 0) <= int(time.time()):
+        SESSIONS.pop(sid, None)
+        _release_leases_for(sid)
+        return None
+    return sess
+
+def _require(handler, role='read'):
+    if not REMOTE:
+        return {{'id': 'local', 'role': 'writable', 'csrf': 'local'}}
+    if not _host_allowed(handler):
+        _json_error(handler, 403, 'host_not_allowed', 'Host is not allowed')
+        return None
+    sess = _session(handler)
+    if not sess:
+        _json_error(handler, 401, 'unauthenticated', 'authentication required')
+        return None
+    if role == 'write' and sess.get('role') != 'writable':
+        _json_error(handler, 403, 'permission_denied', 'writable credential required')
+        return None
+    return sess
+
+def _require_write(handler):
+    sess = _require(handler, 'write')
+    if not sess:
+        return None
+    if not _origin_allowed(handler):
+        _json_error(handler, 403, 'origin_not_allowed', 'Origin is not allowed')
+        return None
+    token = handler.headers.get('X-CSRF-Token') or ''
+    if token != sess.get('csrf'):
+        _json_error(handler, 403, 'csrf_failed', 'valid CSRF token required')
+        return None
+    return sess
+
+def _set_session_cookie(handler, sid):
+    attrs = ['HttpOnly', 'SameSite=Lax', 'Path=/']
+    if str(handler.headers.get('X-Forwarded-Proto') or '').lower() == 'https':
+        attrs.append('Secure')
+    handler.send_header('Set-Cookie', SESSION_COOKIE + '=' + sid + '; ' + '; '.join(attrs))
+
+def _read_payload(handler):
+    length = int(handler.headers.get('content-length') or '0')
+    raw = handler.rfile.read(length).decode('utf-8') if length else '{{}}'
+    content_type = str(handler.headers.get('content-type') or '').split(';', 1)[0].strip().lower()
+    if content_type == 'application/x-www-form-urlencoded':
+        flat = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        return {{k: v[-1] if v else '' for k, v in flat.items()}}
+    return json.loads(raw or '{{}}')
+
+def _sanitize(obj):
+    hidden = {{'url','readonly_url','ttyd_url','readonly_ttyd_url','cwd','prompt_path','stdout_log','stderr_log','cmd','web_state','state_path','db_path','backend_credential','readonly_backend_credential'}}
+    if isinstance(obj, dict):
+        out = {{}}
+        for k, v in obj.items():
+            if k in hidden:
+                continue
+            if k == 'default_workdir':
+                continue
+            if isinstance(v, str):
+                v = core.re.sub(r'http://127\\.0\\.0\\.1:\\d+/', '/ttyd/internal/', v)
+            out[k] = _sanitize(v)
+        return out
+    if isinstance(obj, list):
+        return [_sanitize(x) for x in obj]
+    return obj
+
+def _remote_cockpit_html():
+    body = core._cockpit_html('__all__', embed=False)
+    body = body.replace('<meta charset="utf-8"><title>', '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>')
+    body = body.replace('</style>', '.mobile-only{{display:none}}@media(max-width:760px){{html,body{{height:100dvh;overflow:hidden}}body.mobile-drawer-open{{touch-action:none}}.app{{display:block;width:100vw;height:100dvh;overflow:hidden}}.main{{width:100vw;height:100dvh;min-height:0;display:grid;grid-template-rows:42px minmax(0,1fr);overflow:hidden}}.top{{height:42px;min-height:42px;max-height:42px;padding:6px 8px;gap:8px;overflow:hidden}}.top strong{{font-size:13px;white-space:nowrap}}.top .small:not(#remoteStatus):not(#attention),#layouts{{display:none}}.mobile-only{{display:inline-flex;align-items:center;justify-content:center}}#mobileSessionToggle{{min-width:38px;height:30px;padding:0 9px}}.side{{position:fixed;left:0;right:0;top:42px;bottom:0;z-index:30;display:grid;grid-template-rows:auto minmax(0,1fr) auto;width:100vw;border-right:0;border-top:1px solid #26313d;background:#111822;padding:8px;min-height:0;transform:translateY(100%);transition:transform .18s ease;box-shadow:0 -18px 40px #0009}}body.mobile-drawer-open .side,.app.mobile-drawer-open .side{{transform:translateY(0)}}#sessions{{min-height:0;overflow:auto;-webkit-overflow-scrolling:touch}}.side-tabs{{margin-bottom:6px}}.panes,.panes[class*="layout-"]{{display:grid!important;grid-template-columns:1fr!important;grid-template-rows:1fr!important;width:100%;height:100%;min-height:0;overflow:hidden}}.pane{{display:none;border-right:0;border-bottom:0;min-height:0;overflow:hidden}}.pane.active{{display:grid}}.ph{{height:34px;line-height:18px;padding:8px}}.body,.body iframe{{height:100%;min-height:0;max-height:100%;overflow:hidden}}.chip{{padding:8px 9px 8px 12px;margin:4px 0}}.root-title{{padding:8px}}.recent-workset{{margin:0 0 10px;padding:6px 7px}}.board-title{{margin:7px 0 4px}}#archiveDrop{{display:none}}}}</style>')
+    body = body.replace('<strong>Session Cockpit</strong>', '<button id="mobileSessionToggle" class="layoutBtn mobile-only" title="Sessions" onclick="toggleMobileSessions()">☰</button><strong>Session Cockpit</strong><span id="remoteStatus" class="small">Remote control</span>')
+    body = body.replace("function desiredPaneSrc(r){{if(!r)return ''; if(r.has_session&&!r.tmux_alive&&r.url)return `${{r.url}}?cockpit=1&t=${{Date.now()}}`; return `${{(r.ttyd_url||r.url)}}${{(r.ttyd_url?'':'?cockpit=1&t='+Date.now())}}`}}", "function desiredPaneSrc(r){{if(!r)return '';let url='/ttyd/'+encodeURIComponent(r.task_id)+'?mode=auto';if(remoteMe.csrf_token)url+='&csrf='+encodeURIComponent(remoteMe.csrf_token);return url}}")
+    body = body.replace("fetch('/resume/'+encodeURIComponent(task),{{cache:'no-store'}})", "fetch('/resume/'+encodeURIComponent(task),{{method:'POST',headers:remoteHeaders(),body:JSON.stringify({{}})}})")
+    body = body.replace("fetch('/roles/'+encodeURIComponent(b||'')+'/'+encodeURIComponent(role)+'/open',{{cache:'no-store'}})", "fetch('/roles/'+encodeURIComponent(b||'')+'/'+encodeURIComponent(role)+'/open',{{method:'POST',headers:remoteHeaders(),body:JSON.stringify({{}})}})")
+    body = body.replace("headers:{{'Content-Type':'application/json'}}", "headers:remoteHeaders()")
+    body = body.replace("const storageKey='kanban-cockpit-state';", "const storageKey='kanban-cockpit-state';let remoteMe={{remote:true,role:'unknown',csrf_token:''}};function remoteHeaders(){{return {{'Content-Type':'application/json','X-CSRF-Token':remoteMe.csrf_token||''}}}}function setMobileSessionsOpen(open){{document.body.classList.toggle('mobile-drawer-open',!!open);const app=document.querySelector('.app');if(app)app.classList.toggle('mobile-drawer-open',!!open);const btn=document.getElementById('mobileSessionToggle');if(btn)btn.setAttribute('aria-expanded',open?'true':'false');}}function toggleMobileSessions(){{setMobileSessionsOpen(!document.body.classList.contains('mobile-drawer-open'))}}fetch('/auth/me',{{cache:'no-store'}}).then(r=>r.json()).then(m=>{{remoteMe=m;if(document.getElementById('remoteStatus'))document.getElementById('remoteStatus').textContent='Remote '+(m.role||'unknown');updatePaneFrames();}}).catch(()=>{{}});")
+    body = body.replace("function setPane(i,task){{const from=panes.findIndex(x=>x===task);const targetOld=panes[i]; if(from>=0&&from!==i){{panes[i]=task;panes[from]=targetOld||null;replacePaneDom(i);replacePaneDom(from);}} else {{panes[i]=task;replacePaneDom(i);}} active=i;touchRecent(task);saveState();setActive(i);renderSide(); if(visibleIds().indexOf(i+1)<0)renderPanes(); updatePaneHeaders(); updatePaneFrames();}}", "function setPane(i,task){{const from=panes.findIndex(x=>x===task);const targetOld=panes[i]; if(from>=0&&from!==i){{panes[i]=task;panes[from]=targetOld||null;replacePaneDom(i);replacePaneDom(from);}} else {{panes[i]=task;replacePaneDom(i);}} active=i;touchRecent(task);saveState();setActive(i);renderSide(); if(visibleIds().indexOf(i+1)<0)renderPanes(); updatePaneHeaders(); updatePaneFrames();setMobileSessionsOpen(false);}}")
+    body = body.replace("function setActive(i){{active=i;if(panes[i])touchRecent(panes[i]);document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));}}", "function setActive(i){{active=i;if(panes[i])touchRecent(panes[i]);document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',Number(p.querySelector('.ph')?.dataset.pane)===active));setMobileSessionsOpen(false);}}")
+    body = body.replace("function paneAction(r){{if(!r||!r.task_id||r.task_status==='archived')return '';", "function paneAction(r){{if(remoteMe.role==='readonly')return '<span class=\\\"small\\\">readonly</span>';if(!r||!r.task_id||r.task_status==='archived')return '';")
+    body = body.replace("if(desired&&frame.src!==desired)frame.src=desired;", "if(desired&&frame.getAttribute('src')!==desired)frame.setAttribute('src',desired);")
+    return body
+
+def _login_html():
+    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kanban Remote Login</title><style>html,body{{margin:0;min-height:100%;background:#111827;color:#e5e7eb;font:16px system-ui,sans-serif}}body{{display:grid;place-items:center;padding:24px}}form{{width:min(360px,100%);display:grid;gap:12px}}input,button{{font:inherit;border-radius:8px;border:1px solid #374151;padding:12px;background:#0b1220;color:#e5e7eb}}button{{background:#2563eb;border-color:#2563eb}}</style></head><body><form method="post"><input name="secret" type="password" placeholder="Login code" autocomplete="current-password" autofocus><button>Login</button></form><script>function safeNext(value){{if(!value||value==="/login")return "/cockpit";if(value[0]!=="/"||value.startsWith("//"))return "/cockpit";return value;}}document.querySelector("form").addEventListener("submit",async e=>{{e.preventDefault();const secret=document.querySelector("input[name=secret]").value;const r=await fetch("/login",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{secret}})}});if(r.ok){{const q=new URLSearchParams(location.search);location.href=safeNext(q.get("next")||location.pathname);}}else alert("Invalid login code");}});</script></body></html>'
+
+def _remote_mobile_html():
+    return '''<!doctype html><html data-shell="remote-mobile"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Kanban Mobile</title><style>
+*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;background:#05070a;color:#dbe3ea;font:13px system-ui,sans-serif;overflow:hidden}}body{{height:100dvh}}button,input{{font:inherit}}.app{{display:grid;grid-template-rows:44px minmax(0,1fr);height:100dvh;width:100vw;overflow:hidden}}.bar{{display:flex;align-items:center;gap:8px;height:44px;padding:7px 8px;background:#111822;border-bottom:1px solid #26313d;overflow:hidden}}.iconBtn{{height:30px;min-width:34px;border:1px solid #334155;border-radius:6px;background:#17202b;color:#dbe3ea}}.title{{font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}}.meta{{color:#94a3b8;white-space:nowrap;font-size:12px}}.stage{{position:relative;min-height:0;background:#05070a;overflow:hidden}}#taskBoard{{height:100%;overflow:auto;-webkit-overflow-scrolling:touch;padding:10px;background:#0b0f14}}.section{{margin:0 0 14px}}.sectionHead{{display:flex;align-items:center;justify-content:space-between;margin:0 0 7px;color:#93c5fd;text-transform:uppercase;font-size:12px;font-weight:800;letter-spacing:.03em}}.count{{color:#94a3b8;font-weight:600;text-transform:none}}.taskList{{display:grid;gap:7px}}.task{{display:block;width:100%;text-align:left;padding:10px;border:1px solid #26313d;border-radius:7px;background:#101827;color:#dbe3ea;overflow:hidden}}.task:active{{background:#172033}}.task.active{{border-color:#60a5fa;background:#13243a}}.task.attn{{border-color:#f59e0b;color:#fde68a}}.task.running{{border-color:#38bdf8}}.taskTop{{display:flex;align-items:center;gap:7px;min-width:0}}.taskName{{font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}}.taskSub{{margin-top:4px;color:#94a3b8;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.pill{{border:1px solid #334155;border-radius:999px;padding:1px 6px;color:#94a3b8;font-size:11px;flex:0 0 auto}}.emptyBlock{{border:1px dashed #334155;border-radius:7px;color:#64748b;padding:12px;text-align:center}}#terminalView{{display:none;height:100%;min-height:0;background:#05070a;overflow:hidden;grid-template-rows:minmax(0,1fr) auto}}#terminalFrame{{display:block;width:100%;height:100%;border:0;background:#05070a}}.mobileInput{{display:flex;gap:6px;padding:7px;background:#111822;border-top:1px solid #26313d;align-items:center}}#mobileInputText{{min-width:0;flex:1;border:1px solid #334155;border-radius:6px;background:#05070a;color:#dbe3ea;padding:9px}}#mobileInputText:disabled{{opacity:.55}}.error{{color:#fb7185}}@media(max-height:520px){{.bar{{height:38px;padding:5px 7px}}.app{{grid-template-rows:38px minmax(0,1fr)}}.mobileInput{{padding:5px}}#mobileInputText{{padding:7px}}}}
+</style></head><body><div class="app"><header class="bar"><button id="backToList" class="iconBtn" title="Sessions">☰</button><div id="activeTitle" class="title">Kanban Mobile</div><div id="remoteRole" class="meta">Remote</div><div id="attention" class="meta"></div></header><main class="stage"><div id="taskBoard"><section class="section"><div class="sectionHead">Attention <span id="attentionCount" class="count"></span></div><div id="attentionList" class="taskList"></div></section><section class="section"><div class="sectionHead">Running <span id="runningCount" class="count"></span></div><div id="runningList" class="taskList"></div></section><section class="section"><div class="sectionHead">Recent <span id="recentCount" class="count"></span></div><div id="recentList" class="taskList"></div></section></div><div id="terminalView"><div id="sessionMessage" class="emptyBlock" style="display:none;margin:10px">No connectable session</div><iframe id="terminalFrame" allow="clipboard-read; clipboard-write"></iframe><form id="mobileInputBar" class="mobileInput"><input id="mobileInputText" autocomplete="off" autocapitalize="off" placeholder="Type to TUI"><button id="mobileInputEnter" class="iconBtn" title="Enter">↵</button></form></div></main></div><script>
+let sessions={{roots:[]}};let activeTaskId=localStorage.getItem('kanban-mobile-active')||'';let remoteMe={{role:'unknown'}};
+function esc(s){{return String(s==null?'':s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]))}}
+function allTasks(){{const out=[];for(const root of (sessions.roots||[])){{for(const task of (root.roles||[])){{if(task&&task.task_id)out.push(Object.assign({{}},task,{{root_title:root.title,root_attention:root.attention||0}}))}}}}return out}}
+function taskLabel(task){{return task.display_title||task.title||task.task_id||'session'}}
+	function taskSub(task){{const bits=[];if(task.board_title)bits.push(task.board_title);if(task.role)bits.push(task.role);if(task.task_status)bits.push(task.task_status);return bits.join(' / ')}}
+	function isRunning(task){{return !!(task.live||task.tmux_alive||task.task_status==='running')}}
+	function canConnect(task){{return !!(task&&task.ttyd_alive)}}
+	function canResume(task){{return !!(task&&task.task_id&&!canConnect(task)&&remoteMe.role==='writable')}}
+	function canMobileInput(task){{return !!(task&&task.task_id&&remoteMe.role==='writable')}}
+	function mobileHeaders(){{return {{'Content-Type':'application/json','X-CSRF-Token':remoteMe.csrf_token||''}}}}
+function rankTasks(tasks){{return [...tasks].sort((a,b)=>Number(b.pending_approval||false)-Number(a.pending_approval||false)||Number(isRunning(b))-Number(isRunning(a))||Number(b.changed_at||0)-Number(a.changed_at||0))}}
+function cardHtml(task){{const icon=task.pending_approval?'🔔':(isRunning(task)?'●':'○');const cls='task '+(task.task_id===activeTaskId?'active ':'')+(task.pending_approval?'attn ':'')+(isRunning(task)?'running':'');let state='';if(!canConnect(task))state=canResume(task)?' · Resume':' · no session, needs writable login';const taskId=esc(task.task_id);return '<button class="'+cls+'" data-task="'+taskId+'" data-task-id="'+taskId+'"><div class="taskTop"><span>'+icon+'</span><span class="taskName">'+esc(taskLabel(task))+'</span><span class="pill">'+esc(task.task_status||'')+'</span></div><div class="taskSub">'+esc(taskSub(task)+state)+'</div></button>'}}
+function renderList(id,tasks,emptyText){{const el=document.getElementById(id);const count=document.getElementById(id.replace('List','Count'));if(count)count.textContent=tasks.length?String(tasks.length):'';el.innerHTML=tasks.length?tasks.map(cardHtml).join(''):'<div class="emptyBlock">'+esc(emptyText)+'</div>';el.querySelectorAll('[data-task]').forEach(btn=>btn.onclick=()=>showTerminal(tasks.find(t=>t.task_id===btn.dataset.task)))}}
+function renderTaskBoard(){{const tasks=rankTasks(allTasks());const attention=tasks.filter(t=>t.pending_approval);const running=tasks.filter(t=>!t.pending_approval&&isRunning(t));const used=new Set([...attention,...running].map(t=>t.task_id));const recent=tasks.filter(t=>!used.has(t.task_id)).slice(0,12);renderList('attentionList',attention,'No attention tasks');renderList('runningList',running,'No running tasks');renderList('recentList',recent,'No recent tasks')}}
+	function showTaskBoard(){{document.getElementById('taskBoard').style.display='block';document.getElementById('terminalView').style.display='none';document.getElementById('activeTitle').textContent='Kanban Mobile';renderTaskBoard()}}
+	async function resumeTask(task){{if(!canResume(task))return;const msg=document.getElementById('sessionMessage');msg.style.display='block';msg.textContent='Resuming session...';try{{const r=await fetch('/resume/'+encodeURIComponent(task.task_id),{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':remoteMe.csrf_token||''}},body:JSON.stringify({{}})}});const data=await r.json();if(!data.ok){{msg.textContent=data.error||'Resume failed';return}}await refresh();const fresh=allTasks().find(t=>t.task_id===task.task_id)||task;showTerminal(fresh)}}catch(e){{msg.textContent='Resume failed: '+String(e)}}}}
+	function updateMobileInput(task){{const input=document.getElementById('mobileInputText');const btn=document.getElementById('mobileInputEnter');const allowed=canMobileInput(task);input.disabled=!allowed;btn.disabled=!allowed;input.placeholder=allowed?'Type to TUI':'Readonly or occupied'}}
+	async function submitMobileInput(){{const task=allTasks().find(t=>t.task_id===activeTaskId);const input=document.getElementById('mobileInputText');if(!canMobileInput(task))return;const text=input.value;input.value='';try{{const r=await fetch('/mobile-input/'+encodeURIComponent(activeTaskId),{{method:'POST',headers:mobileHeaders(),body:JSON.stringify({{text,enter:true}})}});const data=await r.json();if(!data.ok){{const msg=document.getElementById('sessionMessage');msg.style.display='block';msg.textContent=data.error||'Input failed'}}}}catch(e){{const msg=document.getElementById('sessionMessage');msg.style.display='block';msg.textContent='Input failed: '+String(e)}}}}
+	function showTerminal(task){{if(!task||!task.task_id)return;activeTaskId=task.task_id;localStorage.setItem('kanban-mobile-active',activeTaskId);document.getElementById('taskBoard').style.display='none';document.getElementById('terminalView').style.display='grid';document.getElementById('activeTitle').textContent=taskLabel(task);const msg=document.getElementById('sessionMessage');const frame=document.getElementById('terminalFrame');updateMobileInput(task);if(!canConnect(task)){{msg.style.display='block';msg.textContent=canResume(task)?'No connectable session. Tap Resume from the list or wait for recovery.':'No connectable session. This task needs writable login to resume.';frame.removeAttribute('src');frame.style.display='none';if(canResume(task))resumeTask(task);renderTaskBoard();return}}msg.style.display='none';frame.style.display='block';let desired='/ttyd/'+encodeURIComponent(task.task_id)+'?mode=auto';if(remoteMe.csrf_token)desired+='&csrf='+encodeURIComponent(remoteMe.csrf_token);if(frame.getAttribute('src')!==desired)frame.setAttribute('src',desired);renderTaskBoard();setTimeout(()=>document.getElementById('mobileInputText')?.focus(),0)}}
+async function refresh(){{try{{const r=await fetch('/sessions',{{cache:'no-store'}});if(r.status===401){{location.href='/login?next='+encodeURIComponent(location.pathname);return}}sessions=await r.json();const att=(sessions.roots||[]).reduce((n,root)=>n+Number(root.attention||0),0);document.getElementById('attention').textContent=att?'🔔 '+att:'';document.title=(att?'🔔 ':'')+'Kanban Mobile';renderTaskBoard();if(activeTaskId&&document.getElementById('terminalView').style.display==='block'){{const current=allTasks().find(t=>t.task_id===activeTaskId);if(current)document.getElementById('activeTitle').textContent=taskLabel(current)}}}}catch(e){{document.getElementById('recentList').innerHTML='<div class="error">Disconnected</div>'}}}}
+	document.getElementById('mobileInputBar').onsubmit=e=>{{e.preventDefault();submitMobileInput()}};document.getElementById('backToList').onclick=showTaskBoard;fetch('/auth/me',{{cache:'no-store'}}).then(r=>r.json()).then(m=>{{remoteMe=m;document.getElementById('remoteRole').textContent='Remote '+(m.role||'unknown');renderTaskBoard();const task=allTasks().find(t=>t.task_id===activeTaskId);if(task)updateMobileInput(task)}}).catch(()=>{{}});setInterval(refresh,3000);refresh();
+</script></body></html>'''
+
+def _resume_task(task_id):
+    board = core._find_board_for_task(task_id)
+    if not board:
+        return {{"ok": False, "code": "task_not_found", "error": "task not found"}}
+    provider = None
+    try:
+        conn = core.kb.connect(board=board)
+        try:
+            row = conn.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row:
+                provider = core._parse_role_body(row['body']).get('provider')
+        finally:
+            conn.close()
+    except Exception:
+        provider = None
+    def do_resume():
+        if provider == 'claude':
+            return core.run(board=board, task_id=task_id)
+        return core.codex_web(board, task_id, reuse=False)
+    if not REMOTE:
+        return do_resume()
+    with RESUME_LOCK:
+        old_guard = core.os.environ.get('KANBAN_AGENCY_TTYD_BACKEND_CREDENTIALS')
+        core.os.environ['KANBAN_AGENCY_TTYD_BACKEND_CREDENTIALS'] = '1'
+        try:
+            return do_resume()
+        finally:
+            if old_guard is None:
+                core.os.environ.pop('KANBAN_AGENCY_TTYD_BACKEND_CREDENTIALS', None)
+            else:
+                core.os.environ['KANBAN_AGENCY_TTYD_BACKEND_CREDENTIALS'] = old_guard
+
+def _task_web_state(task_id):
+    state = core._read_json_file(core._codex_web_state_path(task_id))
+    if not state:
+        state = core._read_json_file(core._claude_web_state_path(task_id))
+    if not state:
+        state = core._read_json_file(core._hermes_web_state_path(task_id))
+    return state if isinstance(state, dict) else {{}}
+
+def _choose_ttyd_backend(task_id, mode, sess):
+    state = _task_web_state(task_id)
+    if not state:
+        return None, {{"ok": False, "code": "session_state_missing", "error": "session state missing", "status": 404}}
+    role = (sess or {{}}).get('role')
+    wants_write = mode in ('write', 'auto') and role == 'writable'
+    if wants_write:
+        lease = _lease(task_id, sess)
+        if not lease:
+            return None, {{"ok": False, "code": "write_lease_held", "error": "TUI is already controlled by another writable session", "status": 409}}
+        url = state.get('url')
+        if url:
+            credential = state.get('backend_credential')
+            if REMOTE and not credential:
+                return None, {{"ok": False, "code": "ttyd_backend_unprotected", "error": "ttyd backend was created before remote backend credentials; resume this session to rebuild the protected wrapper", "status": 409}}
+            return {{'url': str(url), 'credential': str(credential or '')}}, None
+        if mode == 'write':
+            return None, {{"ok": False, "code": "writable_ttyd_not_found", "error": "writable ttyd backend missing", "status": 404}}
+    url = state.get('readonly_url')
+    if not url:
+        return None, {{"ok": False, "code": "readonly_ttyd_not_found", "error": "readonly ttyd backend missing", "status": 404}}
+    credential = state.get('readonly_backend_credential')
+    if REMOTE and not credential:
+        return None, {{"ok": False, "code": "ttyd_backend_unprotected", "error": "ttyd backend was created before remote backend credentials; resume this session to rebuild the protected wrapper", "status": 409}}
+    return {{'url': str(url), 'credential': str(credential or '')}}, None
+
+def _ttyd_write_request_allowed(handler, mode, sess):
+    if not REMOTE:
+        return True
+    role = (sess or {{}}).get('role')
+    if not (mode in ('write', 'auto') and role == 'writable'):
+        return True
+    origin = str(handler.headers.get('Origin') or handler.headers.get('Referer') or '').strip().rstrip('/')
+    if origin and not _origin_allowed(handler):
+        _json_error(handler, 403, 'origin_not_allowed', 'Origin is not allowed')
+        return False
+    qs = urllib.parse.parse_qs(urlparse(handler.path).query)
+    token = (qs.get('csrf') or [''])[0] or handler.headers.get('X-CSRF-Token') or ''
+    if token != (sess or {{}}).get('csrf'):
+        _json_error(handler, 403, 'csrf_failed', 'valid CSRF token required for writable ttyd')
+        return False
+    return True
+
+def _ttyd_target_url(handler, task_id, backend):
+    parsed = urlparse(handler.path)
+    base = str(backend.get('url') if isinstance(backend, dict) else backend).rstrip('/') + '/'
+    suffix = parsed.path.split('/', 2)[2]
+    if suffix == task_id:
+        suffix = ''
+    elif suffix.startswith(task_id + '/'):
+        suffix = suffix[len(task_id)+1:]
+    target = base + suffix
+    query = urllib.parse.urlencode([(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if k != 'csrf'])
+    if query:
+        target += '?' + query
+    return target
+
+def _massage_ttyd_body(body, ctype):
+    if 'text/html' not in str(ctype or '').lower():
+        return body
+    try:
+        text = body.decode('utf-8')
+    except Exception:
+        return body
+    if 'name="viewport"' not in text:
+        text = text.replace('<head>', '<head><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">', 1)
+    text = text.replace('c={{fontSize:13,fontFamily:', 'c={{fontSize:(window.innerWidth<=760?6:13),fontFamily:', 1)
+    mobile_css = '<style data-kanban-mobile-ttyd>html,body,#terminal-container{{width:100%;height:100%;overflow:hidden;-webkit-text-size-adjust:100%;text-size-adjust:100%}}#terminal-container{{margin:0;padding:0}}#terminal-container .terminal{{height:100%;padding:0}}@media(max-width:760px){{.xterm{{font-size:12px!important}}.xterm-screen canvas{{max-width:none!important}}}}</style>'
+    if 'data-kanban-mobile-ttyd' not in text:
+        text = text.replace('</head>', mobile_css + '</head>', 1)
+    return text.encode('utf-8')
+
+def _tunnel_websocket(handler, task_id, backend):
+    target = _ttyd_target_url(handler, task_id, backend)
+    parsed = urlparse(target)
+    host = parsed.hostname or '127.0.0.1'
+    port = int(parsed.port or (443 if parsed.scheme == 'https' else 80))
+    if parsed.scheme == 'https':
+        _json_error(handler, 502, 'ttyd_proxy_failed', 'https ttyd backends are not supported by the built-in tunnel')
+        return
+    path = parsed.path or '/'
+    if parsed.query:
+        path += '?' + parsed.query
+    upstream = socket.create_connection((host, port), timeout=10)
+    try:
+        lines = [f"GET {{path}} HTTP/1.1\\r\\n"]
+        for key, value in handler.headers.items():
+            lower = key.lower()
+            if lower in ('host', 'connection', 'cookie', 'authorization', 'x-csrf-token'):
+                continue
+            lines.append(f"{{key}}: {{value}}\\r\\n")
+        credential = backend.get('credential') if isinstance(backend, dict) else ''
+        if credential:
+            token = base64.b64encode(str(credential).encode('utf-8')).decode('ascii')
+            lines.append(f"Authorization: Basic {{token}}\\r\\n")
+        lines.append(f"Host: {{parsed.netloc}}\\r\\n")
+        lines.append("Connection: Upgrade\\r\\n")
+        lines.append("\\r\\n")
+        upstream.sendall(''.join(lines).encode('iso-8859-1'))
+        handler.close_connection = True
+        sockets = [handler.connection, upstream]
+        while True:
+            readable, _, _ = select.select(sockets, [], [], 60)
+            if not readable:
+                break
+            for sock in readable:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return
+                (upstream if sock is handler.connection else handler.connection).sendall(chunk)
+    finally:
+        try:
+            upstream.close()
+        except Exception:
+            pass
+
+def _proxy_ttyd(handler, task_id, sess):
+    parsed = urlparse(handler.path)
+    qs = urllib.parse.parse_qs(parsed.query)
+    mode = (qs.get('mode') or ['auto'])[0]
+    if not _ttyd_write_request_allowed(handler, mode, sess):
+        return
+    backend, err = _choose_ttyd_backend(task_id, mode, sess)
+    if err:
+        _json_error(handler, int(err.pop('status', 502)), err.get('code') or 'ttyd_unavailable', err.get('error') or 'ttyd unavailable')
+        return
+    target = _ttyd_target_url(handler, task_id, backend)
+    if str(handler.headers.get('Upgrade') or '').lower() == 'websocket':
+        try:
+            _tunnel_websocket(handler, task_id, backend)
+        except Exception as exc:
+            _json_error(handler, 502, 'ttyd_websocket_failed', 'ttyd websocket tunnel failed: ' + str(exc))
+        return
+    try:
+        headers = {{'User-Agent': 'kanban-agency-gateway'}}
+        credential = backend.get('credential') if isinstance(backend, dict) else ''
+        if credential:
+            token = base64.b64encode(str(credential).encode('utf-8')).decode('ascii')
+            headers['Authorization'] = 'Basic ' + token
+        req = urllib.request.Request(target, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as upstream:
+            body = upstream.read()
+            ctype = upstream.headers.get('content-type') or 'application/octet-stream'
+            body = _massage_ttyd_body(body, ctype)
+            handler.close_connection = True
+            handler.send_response(int(getattr(upstream, 'status', 200)))
+            handler.send_header('content-type', ctype)
+            handler.send_header('connection', 'close')
+            handler._no_cache_headers()
+            handler.send_header('content-length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+    except Exception as exc:
+        _json_error(handler, 502, 'ttyd_proxy_failed', 'ttyd proxy failed: ' + str(exc))
+
+def _remote_sessions_payload():
+    return core._sessions_all_payload({{'ok': True, 'skipped': 'remote-read'}}, auto_advance=False)
+
+def _release_leases_for(sid):
+    for task, lease in list(LEASES.items()):
+        if lease.get('owner_session_id') == sid:
+            LEASES.pop(task, None)
+
+def _lease(task_id, sess):
+    now = int(time.time())
+    for task, lease in list(LEASES.items()):
+        if int(lease.get('expires_at') or 0) <= now:
+            LEASES.pop(task, None)
+    current = LEASES.get(task_id)
+    if current and current.get('owner_session_id') != sess.get('id'):
+        return None
+    lease = {{'owner_session_id': sess.get('id'), 'acquired_at': current.get('acquired_at') if current else now, 'last_seen_at': now, 'expires_at': now + LEASE_TTL}}
+    LEASES[task_id] = lease
+    return lease
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): return
     def _no_cache_headers(self):
@@ -3707,12 +4250,53 @@ class H(BaseHTTPRequestHandler):
         self.send_header('expires','0')
     def _send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False, indent=2).encode()
-        self.send_response(status); self.send_header('content-type','application/json'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.close_connection = True
+        self.send_response(status); self.send_header('content-type','application/json'); self.send_header('connection','close'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def _send_html(self, body, status=200):
         if isinstance(body, str): body = body.encode()
-        self.send_response(status); self.send_header('content-type','text/html; charset=utf-8'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.close_connection = True
+        self.send_response(status); self.send_header('content-type','text/html; charset=utf-8'); self.send_header('connection','close'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
         path = urlparse(self.path).path
+        if REMOTE and path not in ('/login','/logout'):
+            sess = _require_write(self)
+            if not sess: return
+        if path == '/login':
+            if not REMOTE:
+                _json_error(self, 404, 'not_remote', 'login is only available in remote mode'); return
+            if not _host_allowed(self):
+                _json_error(self, 403, 'host_not_allowed', 'Host is not allowed'); return
+            try:
+                payload = _read_payload(self)
+            except Exception as exc:
+                _json_error(self, 400, 'invalid_json', 'invalid json: ' + str(exc)); return
+            secret = str(payload.get('secret') or '')
+            role = None
+            if secrets.compare_digest(secret, str(AUTH.get('writable_secret') or '')):
+                role = 'writable'
+            elif secrets.compare_digest(secret, str(AUTH.get('readonly_secret') or '')):
+                role = 'readonly'
+            if not role:
+                _json_error(self, 401, 'bad_credentials', 'invalid credentials'); return
+            sid = secrets.token_urlsafe(32)
+            sess = {{'id': sid, 'role': role, 'csrf': secrets.token_urlsafe(32), 'expires_at': int(time.time()) + SESSION_TTL}}
+            SESSIONS[sid] = sess
+            body = json.dumps({{'ok': True, 'role': role, 'csrf_token': sess['csrf'], 'remote': True}}, ensure_ascii=False).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self._no_cache_headers(); _set_session_cookie(self, sid); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path == '/logout':
+            if REMOTE:
+                sess = _require(self)
+                if not sess: return
+                if not _origin_allowed(self):
+                    _json_error(self, 403, 'origin_not_allowed', 'Origin is not allowed'); return
+                token = self.headers.get('X-CSRF-Token') or ''
+                if token != sess.get('csrf'):
+                    _json_error(self, 403, 'csrf_failed', 'valid CSRF token required'); return
+            sess = _session(self)
+            if sess:
+                SESSIONS.pop(sess.get('id'), None); _release_leases_for(sess.get('id'))
+            body = json.dumps({{'ok': True}}, ensure_ascii=False).encode()
+            self.send_response(200); self.send_header('content-type','application/json'); self._no_cache_headers(); self.send_header('Set-Cookie', SESSION_COOKIE + '=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/boards':
             try:
                 length = int(self.headers.get('content-length') or '0')
@@ -3760,6 +4344,28 @@ class H(BaseHTTPRequestHandler):
                 self._send_json({{'ok': False, 'error': 'invalid json: ' + str(exc)}}, status=400); return
             data = core.update_task_title_api(task_id, payload)
             self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path.startswith('/resume/'):
+            task_id = path.strip('/').split('/', 1)[1].strip()
+            data = _resume_task(task_id)
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path.startswith('/mobile-input/'):
+            task_id = path.strip('/').split('/', 1)[1].strip()
+            lease = _lease(task_id, sess)
+            if not lease:
+                self._send_json({{'ok': False, 'code': 'write_lease_held', 'error': 'TUI is already controlled by another writable session'}}, status=409); return
+            try:
+                payload = _read_payload(self)
+            except Exception as exc:
+                self._send_json({{'ok': False, 'code': 'invalid_json', 'error': 'invalid json: ' + str(exc)}}, status=400); return
+            data = core.tmux_input_task(task_id, text=str(payload.get('text') or ''), enter=bool(payload.get('enter', True)))
+            self._send_json(data, status=200 if data.get('ok') else 400); return
+        if path.startswith('/roles/') and path.endswith('/open'):
+            parts = path.strip('/').split('/')
+            if len(parts) >= 4:
+                data = core.open_role_workspace(parts[1].strip(), parts[2].strip())
+            else:
+                data = {{"ok": False, "code": "invalid_role_open_path", "error": "invalid role open path"}}
+            self._send_json(data, status=200 if data.get('ok') else 400); return
         if path.startswith('/reopen/'):
             task_id = path.strip('/').split('/', 1)[1].strip()
             try:
@@ -3783,12 +4389,37 @@ class H(BaseHTTPRequestHandler):
         self.send_response(404); self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
+        if REMOTE and path == '/maintenance/cleanup-completed-sessions':
+            _json_error(self, 405, 'method_not_allowed', 'remote write routes require POST'); return
+        if REMOTE and path.startswith('/resume/'):
+            _json_error(self, 405, 'method_not_allowed', 'remote resume requires POST'); return
+        if REMOTE and path.startswith('/roles/') and path.endswith('/open'):
+            _json_error(self, 405, 'method_not_allowed', 'remote role open requires POST'); return
+        if path == '/login':
+            self._send_html(_login_html()); return
+        if path == '/auth/me':
+            sess = _require(self)
+            if not sess: return
+            self._send_json({{'ok': True, 'remote': bool(REMOTE), 'role': sess.get('role'), 'csrf_token': sess.get('csrf')}}); return
         if path == '/':
-            body = core._cockpit_html('__all__', embed=False)
+            if REMOTE and not _host_allowed(self):
+                _json_error(self, 403, 'host_not_allowed', 'Host is not allowed'); return
+            if REMOTE and not _session(self):
+                self._send_html(_login_html()); return
+            body = _remote_cockpit_html() if REMOTE else core._cockpit_html('__all__', embed=False)
             self._send_html(body); return
+        if path in ('/mobile', '/remote/mobile'):
+            if REMOTE and not _host_allowed(self):
+                _json_error(self, 403, 'host_not_allowed', 'Host is not allowed'); return
+            if REMOTE and not _session(self):
+                self._send_html(_login_html()); return
+            self._send_html(_remote_mobile_html()); return
         if path == '/healthz':
             body = b'kanban-agency codex-web-gateway ok\\n'
             self.send_response(200); self.send_header('content-type','text/plain'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if REMOTE and path not in ('/healthz', '/cockpit'):
+            sess = _require(self, 'write' if (path.startswith('/roles/') and path.endswith('/rules')) else 'read')
+            if not sess: return
         if path.startswith('/tmux-scroll/'):
             task_id = path.strip('/').split('/', 1)[1].strip()
             try:
@@ -3808,26 +4439,7 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header('content-type','text/html; charset=utf-8'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/resume/'):
             task_id = path.strip('/').split('/', 1)[1].strip()
-            board = core._find_board_for_task(task_id)
-            if not board:
-                body = json.dumps({{"ok": False, "error": "task not found"}}, ensure_ascii=False).encode()
-            else:
-                provider = None
-                try:
-                    conn = core.kb.connect(board=board)
-                    try:
-                        row = conn.execute('SELECT body FROM tasks WHERE id=?', (task_id,)).fetchone()
-                        if row:
-                            provider = core._parse_role_body(row['body']).get('provider')
-                    finally:
-                        conn.close()
-                except Exception:
-                    provider = None
-                if provider == 'claude':
-                    data = core.run(board=board, task_id=task_id)
-                else:
-                    data = core.codex_web(board, task_id, reuse=False)
-                body = json.dumps(data, ensure_ascii=False, indent=2).encode()
+            body = json.dumps(_resume_task(task_id), ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/maintenance/cleanup-completed-sessions'):
             qs = urlparse(self.path).query
@@ -3839,7 +4451,12 @@ class H(BaseHTTPRequestHandler):
             body = json.dumps(core.cleanup_completed_sessions(max_age_days=days, dry_run=dry), ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self._no_cache_headers(); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/sessions':
-            body = json.dumps(core.sessions_all(), ensure_ascii=False, indent=2).encode()
+            if REMOTE:
+                data = _remote_sessions_payload()
+                data = _sanitize(data)
+            else:
+                data = core.sessions_all()
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/roles/') and path.endswith('/rules'):
             parts = path.strip('/').split('/')
@@ -3863,17 +4480,26 @@ class H(BaseHTTPRequestHandler):
             boards = []
             for b in core.kb.list_boards(include_archived=False):
                 item = dict(b)
-                item['default_workdir'] = item.get('default_workdir')
                 boards.append(item)
-            body = json.dumps({{'ok': True, 'boards': boards}}, ensure_ascii=False, indent=2).encode()
+            data = {{'ok': True, 'boards': boards}}
+            if REMOTE:
+                data = _sanitize(data)
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path.startswith('/sessions/'):
             board = path.strip('/').split('/', 1)[1].strip()
-            body = json.dumps(core.sessions_status(board), ensure_ascii=False, indent=2).encode()
+            data = core.sessions_status(board)
+            if REMOTE:
+                data = _sanitize(data)
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path == '/cockpit':
+            if REMOTE and not _host_allowed(self):
+                _json_error(self, 403, 'host_not_allowed', 'Host is not allowed'); return
+            if REMOTE and not _session(self):
+                self._send_html(_login_html()); return
             embed = 'embed=1' in self.path
-            body = core._cockpit_html('__all__', embed=embed)
+            body = _remote_cockpit_html() if REMOTE else core._cockpit_html('__all__', embed=embed)
             self._send_html(body); return
         if path.startswith('/status/'):
             task_id = path.strip('/').split('/', 1)[1].strip()
@@ -3881,8 +4507,15 @@ class H(BaseHTTPRequestHandler):
             if not board:
                 bridge = core._load_bridge_state(task_id)
                 board = bridge.get('board')
-            body = json.dumps(core.session_alert_status(board, task_id), ensure_ascii=False, indent=2).encode()
+            data = core.session_alert_status(board, task_id)
+            if REMOTE:
+                data = _sanitize(data)
+            body = json.dumps(data, ensure_ascii=False, indent=2).encode()
             self.send_response(200); self.send_header('content-type','application/json'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith('/ttyd/'):
+            parts = path.strip('/').split('/')
+            task_id = parts[1].strip() if len(parts) > 1 else ''
+            _proxy_ttyd(self, task_id, sess if REMOTE else {{'id':'local','role':'writable'}}); return
         if path.startswith('/s/') or path.startswith('/codex/') or path.startswith('/claude/'):
             parts = path.strip('/').split('/', 1)
             prefix = parts[0]
@@ -3919,15 +4552,14 @@ class H(BaseHTTPRequestHandler):
                         conn.close()
                 except Exception:
                     pass
-            if provider == 'claude':
+            if REMOTE:
+                data = {{'ok': True, 'url': '/ttyd/' + task_id + '?mode=auto', 'remote': True}}
+            elif provider == 'claude':
                 data = core.claude_web(board, task_id)
             else:
                 if not board:
                     self.send_response(404); self.end_headers(); self.wfile.write(b'no board for task'); return
-                if core.os.environ.get('KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN') in ('1','true','yes'):
-                    data = {{'ok': True, 'url': 'about:blank', 'spawn_disabled': True}}
-                else:
-                    data = core.codex_web(board, task_id)
+                data = core.codex_web(board, task_id)
             if not data.get('ok'):
                 body = json.dumps(data, ensure_ascii=False, indent=2).encode()
                 self.send_response(500); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
@@ -3953,8 +4585,8 @@ setInterval(poll,3000);setTimeout(loadFrame,2500);poll();
             body = page.encode()
             self.send_response(200); self.send_header('content-type','text/html; charset=utf-8'); self.send_header('cache-control','no-store'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         self.send_response(404); self.end_headers()
-HTTPServer(('127.0.0.1', PORT), H).serve_forever()
-""".format(core=str(plugin_core), port=int(port))
+ThreadingHTTPServer((HOST, PORT), H).serve_forever()
+""".format(core=str(plugin_core), port=int(port), host=host, remote=remote, auth=auth_config)
     script.write_text(gateway_code, encoding='utf-8')
     stdout_path = CODEX_WEB_DIR / 'gateway.stdout.log'
     stderr_path = CODEX_WEB_DIR / 'gateway.stderr.log'
@@ -3963,9 +4595,10 @@ HTTPServer(('127.0.0.1', PORT), H).serve_forever()
         proc = subprocess.Popen([sys.executable, str(script)], stdout=out, stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
     finally:
         out.close(); err.close()
-    state = {"pid": proc.pid, "port": int(port), "url": f"http://127.0.0.1:{int(port)}/", "script": str(script), "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": int(time.time())}
+    warning = "Remote mode does not include built-in HTTPS/TLS; use SSH tunnel, VPN, trusted LAN, or reverse proxy TLS."
+    state = {"pid": proc.pid, "host": host, "port": int(port), "remote": remote, "url": f"http://{host}:{int(port)}/", "script": str(script), "stdout_log": str(stdout_path), "stderr_log": str(stderr_path), "started_at": int(time.time()), "auth_configured": bool(remote), "auth_fingerprint": auth_fingerprint, "warning": warning if remote else ""}
     _write_json_file(CODEX_WEB_GATEWAY_STATE, state)
-    return {"ok": True, "reused": False, "url": state["url"], "state": state}
+    return {"ok": True, "reused": False, "url": state["url"], "state": state, "warning": state.get("warning")}
 
 
 def codex_web_gateway_stop() -> dict[str, Any]:
@@ -4041,6 +4674,318 @@ def scan(board: str, roles_path: Path = CONFIG_PATH) -> dict[str, Any]:
     return {"board": board, "roots": roots, "errors": errors}
 
 
+RELAY_HANDSHAKE_PREFIX = "KANBAN-AGENCY-RELAY/1"
+
+
+def _relay_read_http_message(sock: socket.socket, timeout: float = 30.0) -> bytes:
+    sock.settimeout(timeout)
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > 1024 * 1024:
+            raise ValueError("http headers too large")
+    head, _, body = bytes(data).partition(b"\r\n\r\n")
+    headers: dict[str, str] = {}
+    for line in head.split(b"\r\n")[1:]:
+        if b":" not in line:
+            continue
+        key, value = line.split(b":", 1)
+        headers[key.decode("iso-8859-1", errors="ignore").strip().lower()] = value.decode("iso-8859-1", errors="ignore").strip()
+    if headers.get("expect", "").lower() == "100-continue":
+        return bytes(data)
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        return bytes(data)
+    try:
+        content_length = int(headers.get("content-length") or "0")
+    except ValueError:
+        content_length = 0
+    remaining = content_length - len(body)
+    while remaining > 0:
+        chunk = sock.recv(min(65536, remaining))
+        if not chunk:
+            break
+        data.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(data)
+
+
+def _relay_read_line(sock: socket.socket, limit: int = 4096) -> str:
+    data = bytearray()
+    while len(data) < limit:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if chunk == b"\n":
+            break
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def _relay_pipe(a: socket.socket, b: socket.socket, stop: threading.Event | None = None) -> None:
+    sockets = [a, b]
+    try:
+        for s in sockets:
+            s.setblocking(False)
+        while not (stop and stop.is_set()):
+            readable, _, _ = select.select(sockets, [], [], 30)
+            if not readable:
+                continue
+            for src in readable:
+                try:
+                    chunk = src.recv(65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    return
+                dst = b if src is a else a
+                view = memoryview(chunk)
+                while view:
+                    try:
+                        sent = dst.send(view)
+                        view = view[sent:]
+                    except BlockingIOError:
+                        _, writable, _ = select.select([], [dst], [], 30)
+                        if not writable:
+                            return
+    finally:
+        for s in sockets:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _relay_agent_usable(conn: socket.socket) -> bool:
+    if conn.fileno() < 0:
+        return False
+    try:
+        readable, _, exceptional = select.select([conn], [], [conn], 0)
+    except (OSError, ValueError):
+        return False
+    if exceptional:
+        return False
+    if not readable:
+        return True
+    try:
+        data = conn.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return bool(data)
+
+
+class RelayServer:
+    """Dumb public relay: forwards bytes, owns no Kanban/session semantics."""
+
+    def __init__(self, public_host: str, public_port: int, agent_host: str, agent_port: int, token: str):
+        self.public_host = public_host
+        self.public_port = int(public_port)
+        self.agent_host = agent_host
+        self.agent_port = int(agent_port)
+        self.token = token
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._agents: list[socket.socket] = []
+        self._sockets: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
+
+    @property
+    def agents(self) -> list[socket.socket]:
+        with self._lock:
+            return list(self._agents)
+
+    def start(self) -> "RelayServer":
+        self._public_socket = self._listen(self.public_host, self.public_port)
+        self._agent_socket = self._listen(self.agent_host, self.agent_port)
+        self.public_port = int(self._public_socket.getsockname()[1])
+        self.agent_port = int(self._agent_socket.getsockname()[1])
+        self._threads.append(threading.Thread(target=self._accept_agents, daemon=True))
+        self._threads.append(threading.Thread(target=self._accept_public, daemon=True))
+        for t in self._threads:
+            t.start()
+        return self
+
+    def _listen(self, host: str, port: int) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, int(port)))
+        s.listen(100)
+        s.settimeout(0.5)
+        self._sockets.append(s)
+        return s
+
+    def _accept_agents(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self._agent_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._register_agent, args=(conn,), daemon=True).start()
+
+    def _register_agent(self, conn: socket.socket) -> None:
+        try:
+            line = _relay_read_line(conn)
+            if line != f"{RELAY_HANDSHAKE_PREFIX} {self.token}":
+                conn.close()
+                return
+            with self._lock:
+                self._agents.append(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _take_agent(self, timeout: float = 10.0) -> socket.socket | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self.stop_event.is_set():
+            with self._lock:
+                while self._agents:
+                    conn = self._agents.pop(0)
+                    if _relay_agent_usable(conn):
+                        return conn
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            time.sleep(0.02)
+        return None
+
+    def _accept_public(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self._public_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._handle_public, args=(conn,), daemon=True).start()
+
+    def _handle_public(self, browser: socket.socket) -> None:
+        agent = None
+        try:
+            request = _relay_read_http_message(browser)
+            if not request:
+                return
+            while True:
+                agent = self._take_agent()
+                if agent is None:
+                    browser.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 25\r\n\r\nrelay client unavailable\n")
+                    return
+                try:
+                    agent.sendall(request)
+                    break
+                except OSError:
+                    try:
+                        agent.close()
+                    except Exception:
+                        pass
+                    agent = None
+            _relay_pipe(browser, agent, self.stop_event)
+        except Exception:
+            try:
+                browser.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 13\r\n\r\nrelay failed\n")
+            except Exception:
+                pass
+        finally:
+            for s in (browser, agent):
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self._lock:
+            sockets = list(self._agents)
+            self._agents.clear()
+        sockets.extend(getattr(self, "_sockets", []))
+        for s in sockets:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def serve_forever(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
+
+
+class RelayClient:
+    def __init__(self, relay_host: str, relay_port: int, token: str, target_host: str, target_port: int, connections: int = 4):
+        self.relay_host = relay_host
+        self.relay_port = int(relay_port)
+        self.token = token
+        self.target_host = target_host
+        self.target_port = int(target_port)
+        self.connections = max(1, int(connections))
+        self.stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def start(self) -> "RelayClient":
+        for _ in range(self.connections):
+            t = threading.Thread(target=self._worker, daemon=True)
+            self._threads.append(t)
+            t.start()
+        return self
+
+    def _worker(self) -> None:
+        while not self.stop_event.is_set():
+            relay = None
+            target = None
+            try:
+                relay = socket.create_connection((self.relay_host, self.relay_port), timeout=10)
+                relay.sendall(f"{RELAY_HANDSHAKE_PREFIX} {self.token}\n".encode("utf-8"))
+                request = _relay_read_http_message(relay, timeout=300)
+                if not request:
+                    continue
+                target = socket.create_connection((self.target_host, self.target_port), timeout=10)
+                target.sendall(request)
+                _relay_pipe(relay, target, self.stop_event)
+            except Exception:
+                if not self.stop_event.is_set():
+                    time.sleep(0.2)
+            finally:
+                for s in (relay, target):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def serve_forever(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
+
+
+def relay_server_start(public_host: str = "0.0.0.0", public_port: int = 8767, agent_host: str = "0.0.0.0", agent_port: int = 8768, token: str = "") -> RelayServer:
+    if not token:
+        raise ValueError("relay token is required")
+    return RelayServer(public_host, public_port, agent_host, agent_port, token).start()
+
+
+def relay_client_start(relay_host: str, relay_port: int, token: str, target_host: str = "127.0.0.1", target_port: int = CODEX_WEB_GATEWAY_PORT, connections: int = 4) -> RelayClient:
+    if not token:
+        raise ValueError("relay token is required")
+    return RelayClient(relay_host, relay_port, token, target_host, target_port, connections).start()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="kanban-agency")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -4086,7 +5031,23 @@ def main(argv: list[str] | None = None) -> int:
     web_stop_p.add_argument("--task-id", required=True)
     gw_p = sub.add_parser("codex-web-gateway")
     gw_p.add_argument("--port", type=int, default=CODEX_WEB_GATEWAY_PORT)
+    gw_p.add_argument("--host", default="127.0.0.1")
+    gw_p.add_argument("--remote", action="store_true")
+    gw_p.add_argument("--auth-file")
     gw_stop_p = sub.add_parser("codex-web-gateway-stop")
+    relay_srv_p = sub.add_parser("relay-server")
+    relay_srv_p.add_argument("--public-host", default="0.0.0.0")
+    relay_srv_p.add_argument("--public-port", type=int, default=8767)
+    relay_srv_p.add_argument("--agent-host", default="0.0.0.0")
+    relay_srv_p.add_argument("--agent-port", type=int, default=8768)
+    relay_srv_p.add_argument("--token")
+    relay_cli_p = sub.add_parser("relay-client")
+    relay_cli_p.add_argument("--relay-host", required=True)
+    relay_cli_p.add_argument("--relay-port", type=int, default=8768)
+    relay_cli_p.add_argument("--token")
+    relay_cli_p.add_argument("--target-host", default="127.0.0.1")
+    relay_cli_p.add_argument("--target-port", type=int, default=CODEX_WEB_GATEWAY_PORT)
+    relay_cli_p.add_argument("--connections", type=int, default=4)
     args = parser.parse_args(argv)
     if args.cmd == "scan":
         data = scan(args.board, Path(args.roles))
@@ -4129,13 +5090,23 @@ def main(argv: list[str] | None = None) -> int:
         print(_json(data))
         return 0 if data.get("ok") else 1
     if args.cmd == "codex-web-gateway":
-        data = codex_web_gateway_start(port=args.port)
+        data = codex_web_gateway_start(port=args.port, host=args.host, remote=args.remote, auth_file=args.auth_file)
         print(_json(data))
         return 0 if data.get("ok") else 1
     if args.cmd == "codex-web-gateway-stop":
         data = codex_web_gateway_stop()
         print(_json(data))
         return 0 if data.get("ok") else 1
+    if args.cmd == "relay-server":
+        srv = relay_server_start(public_host=args.public_host, public_port=args.public_port, agent_host=args.agent_host, agent_port=args.agent_port, token=args.token or os.environ.get("KANBAN_RELAY_TOKEN", ""))
+        print(_json({"ok": True, "public_host": args.public_host, "public_port": srv.public_port, "agent_host": args.agent_host, "agent_port": srv.agent_port, "mode": "dumb-forwarding"}), flush=True)
+        srv.serve_forever()
+        return 0
+    if args.cmd == "relay-client":
+        cli = relay_client_start(relay_host=args.relay_host, relay_port=args.relay_port, token=args.token or os.environ.get("KANBAN_RELAY_TOKEN", ""), target_host=args.target_host, target_port=args.target_port, connections=args.connections)
+        print(_json({"ok": True, "relay_host": args.relay_host, "relay_port": args.relay_port, "target_host": args.target_host, "target_port": args.target_port, "connections": args.connections, "mode": "dumb-forwarding"}), flush=True)
+        cli.serve_forever()
+        return 0
     return 1
 
 

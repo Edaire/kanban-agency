@@ -60,7 +60,7 @@ def test_gateway_spawn_disable_guard_exists_for_tests():
     source = Path(core.__file__).read_text()
     assert 'KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN' in source
     assert 'provider spawn disabled by KANBAN_AGENCY_DISABLE_PROVIDER_SPAWN' in source
-    assert "'about:blank'" in source
+    assert "'about:blank'" not in source
 
 def test_writable_interaction_remains_in_s_route_not_cockpit_observer():
     core = load_core()
